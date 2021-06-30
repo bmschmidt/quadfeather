@@ -19,5 +19,5 @@ setup(name='quadfeather',
       author="Benjamin Schmidt",
       author_email="bmschmidt@gmail.com",
       license="MIT",
-      install_requires=["pyarrow", "numpy"]      
+      install_requires=["pyarrow", "numpy", "pandas"]      
 )
