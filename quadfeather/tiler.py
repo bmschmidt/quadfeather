@@ -264,6 +264,7 @@ def main():
 
     # Reflush every tile; bottom-up recursion.
     tiler.final_flush()
+    print("Job complete.")
 
     count = 0
     flushed = 0
