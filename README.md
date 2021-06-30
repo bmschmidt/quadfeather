@@ -6,7 +6,7 @@ Each node in the quadtree is a single feather file containing some number of row
 metadata indicating the existence of children.
 
 ```
-pip install quadfeather
+python -m pip install git+https://github.com/bmschmidt/quadfeather
 quadfeather-test-data 255000 # populates a csv at tmp.csv with 255000 items
 quadfeather --files tmp.csv --tile_size 10000 --destination tiles
 ```
