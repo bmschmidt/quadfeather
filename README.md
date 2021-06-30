@@ -17,7 +17,7 @@ quadfeather --files tmp.csv --tile_size 10000 --destination tiles
 
 1. Allow splitting off of some columns.
 2. Explain JS integration.
-3. Octtree for 3-d data. 
+3. Octtree for 3-d data.
 
 ### Optional todo
 
