@@ -2,7 +2,7 @@ import pyarrow as pa
 from pyarrow import csv, feather
 import pyarrow.compute as pc
 #import pandas as pd
-import logging as logmod
+import logging
 import shutil
 from pathlib import Path
 import sys
@@ -13,7 +13,7 @@ from collections import defaultdict, Counter
 from typing import DefaultDict, Dict, List, Tuple, Set
 import numpy as np
 
-logging = logmod.getLogger("quadtiler")
+logger = logging.getLogger("quadtiler")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Tile an input file into a large number of arrow files.')
@@ -51,7 +51,7 @@ def parse_args():
         default = 30)
 
     args = parser.parse_args()
-    logging.setLevel(args.log_level)
+    logger.setLevel(args.log_level)
 
     return args
 
@@ -61,6 +61,7 @@ def parse_args():
 
 def refine_schema(schema : pa.Schema) -> Dict[str,pa.Schema]:
     fields = {}
+    seen_ix = False
     for el in schema:
         if isinstance(el.type, pa.DictionaryType) and pa.types.is_string(el.type.value_type):
             t = pa.dictionary(pa.int16(), pa.utf8())
@@ -71,9 +72,12 @@ def refine_schema(schema : pa.Schema) -> Dict[str,pa.Schema]:
 #            el = pa.field(el.name, pa.float32())
         elif el.name == "ix":
             fields[el.name] = pa.uint64()
+            seen_ix = True
         else:
             fields[el.name] = el.type
             #fields.append(el)
+    if not seen_ix:
+        fields["ix"] = pa.uint64()
     return fields
 
 def determine_schema(args):
@@ -185,15 +189,15 @@ def main():
         schema, schema_safe = determine_schema(args)
         # currently the dictionary type isn't supported while reading CSVs.
         # So we have to do some monkey business to store it as keys at first, then convert to dictionary later.
-        logging.info("Parsing with schema:")
-        logging.info(schema)
+        logger.info("Parsing with schema:")
+        logger.info(schema)
         rewritten_files, extent, raw_schema = rewrite_in_arrow_format(args.files, schema_safe, schema)
-        logging.info("Done with preliminary build")
+        logger.info("Done with preliminary build")
     else:
         rewritten_files = args.files
         if args.limits[0] > 1e8:
             if len(args.files) > 1:
-                logging.warning("Checking limits for bounding box but only on first passed file, i.e., " + args.files[0])
+                logger.warning("Checking limits for bounding box but only on first passed file, i.e., " + args.files[0])
             xy = feather.read_table(args.files[0], columns=["x", "y"])
             x = pc.min_max(xy['x']).as_py()
             y = pc.min_max(xy['y']).as_py()
@@ -207,11 +211,16 @@ def main():
                 "y": [args.limits[1], args.limits[3]]
             }
 
-        logging.info("extent")
-        logging.info(extent)
-        raw_schema = pa.ipc.RecordBatchFileReader(args.files[0]).schema
+        logger.info("extent")
+        logger.info(extent)
+        first_batch = pa.ipc.RecordBatchFileReader(args.files[0])
+        raw_schema = first_batch.schema
         schema = refine_schema(raw_schema)
-        raw_schema = pa.schema([pa.field(name, type) for name, type in schema.items()])
+        elements = {name : type for name, type in schema.items()}
+        if not "ix" in elements:
+            print("foo\n\n")
+            elements['ix'] = pa.uint64()
+        raw_schema = pa.schema(elements)
 
     tiler = Tile(extent, [0, 0, 0], args)
 
@@ -225,9 +234,13 @@ def main():
         if (pa.types.is_dictionary(field.type)):
             recoders[field.name] = get_recoding_arrays(rewritten_files, field.name)
 
+    count_read = 0
     for i, arrow_block in enumerate(rewritten_files):
         logging.info(f"Reading block {i} of {len(rewritten_files) - 1}")
         tab = feather.read_table(arrow_block)
+        if not "ix" in tab.schema.names:
+            tab = tab.append_column("ix", pa.array(range(count_read, count_read + len(tab)), pa.uint64()))
+            count_read += len(tab)
         # tab = tab.filter(pc.invert(pc.is_null(tab['x'])))
 
         # Drop missing x values, silently
@@ -244,16 +257,16 @@ def main():
 
         tab = pa.table(d).combine_chunks()
 
-        logging.info(f"{len(memory_tiles_open)} partially filled tiles buffered in memory and {len(files_open)} flushing overflow directly to disk.")
+        logger.info(f"{len(memory_tiles_open)} partially filled tiles buffered in memory and {len(files_open)} flushing overflow directly to disk.")
         remaining_tiles = args.max_files - len(memory_tiles_open) - len(files_open)
-        logging.info(f"Inserting block {i} of {len(rewritten_files) - 1}")
+        logger.info(f"Inserting block {i} of {len(rewritten_files) - 1}")
 
         tiler.insert(tab, remaining_tiles)
-        logging.info(f"Done inserting block {i} of {len(rewritten_files) - 1}")
+        logger.info(f"Done inserting block {i} of {len(rewritten_files) - 1}")
 
 #    final_dictionaries = make_final_dictionaries(count_holder)
 
-    logging.info("Initial partition complete--proceeding to children.")
+    logger.info("Initial partition complete--proceeding to children.")
 
     # Flush all open tiles that are not overflown.
     tiler.map_tiles(lambda tile: tile.first_flush())
@@ -272,8 +285,8 @@ def main():
         count += count_here
         flushed += flushed_here
 
-    logging.info(f"{count} added, {flushed} flushed")
-    logging.debug(memory_tiles_open)
+    logger.info(f"{count} added, {flushed} flushed")
+    logger.debug(memory_tiles_open)
 
 def partition(table: pa.Table, midpoint: Tuple[str, float]) -> List[pa.Table]:
     # Divide a table in two based on a midpoint
@@ -419,7 +432,7 @@ class Tile():
         global files_open
         if self._overflow_buffer:
             return self._overflow_buffer
-        logging.debug(f"Opening overflow on {self.coords}")
+        logger.debug(f"Opening overflow on {self.coords}")
 
         fname = self.filename.with_suffix(".overflow.arrow")
         if fname.exists():
@@ -441,7 +454,7 @@ class Tile():
 
 
     def last_check(self):
-        logging.info(f"Finishing: flushed {self.total_points}")
+        logger.info(f"Finishing: flushed {self.total_points}")
 
     @property
     def children(self):
@@ -517,11 +530,11 @@ class Tile():
 
             tile_budget = absolute_max_files - len(memory_tiles_open) - len(files_open)
             if tile_budget < 4:
-                logging.warning(f"Warning--overriding tile budget on {self.coords} to force child creation.")
+                logger.warning(f"Warning--overriding tile budget on {self.coords} to force child creation.")
                 tile_budget = 4
             self.make_children()
 
-            logging.debug(f"Flushing {fin.num_record_batches} batches from {self.coords} with budget of {tile_budget} ({len(files_open)} memory, {len(memory_tiles_open)} tiles waiting to flush in memory)")
+            logger.debug(f"Flushing {fin.num_record_batches} batches from {self.coords} with budget of {tile_budget} ({len(files_open)} memory, {len(memory_tiles_open)} tiles waiting to flush in memory)")
             current_batches = []
             current_size = 0
             for i in range(fin.num_record_batches):
