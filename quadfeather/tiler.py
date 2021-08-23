@@ -277,6 +277,7 @@ def main():
 
     # Reflush every tile; bottom-up recursion.
     tiler.final_flush()
+    print("Job complete.")
 
     count = 0
     flushed = 0
@@ -378,7 +379,7 @@ class Tile():
         """
         self.total_points = 0
         metadata = {
-            "extent": json.dumps(self.extent),
+            "extent": json.dumps({k : [float(f) for f in v] for k, v in self.extent.items()}),
         }
 
         if self._children is None:
