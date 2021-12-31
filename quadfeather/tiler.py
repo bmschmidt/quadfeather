@@ -12,10 +12,11 @@ from numpy import random as nprandom
 from collections import defaultdict, Counter
 from typing import DefaultDict, Dict, List, Tuple, Set
 import numpy as np
+import sys
 
 logger = logging.getLogger("quadtiler")
 
-def parse_args():
+def parse_args(arguments = None):
     parser = argparse.ArgumentParser(description='Tile an input file into a large number of arrow files.')
     parser.add_argument('--first_tile_size', type=int, default = 1000, help ="Number of records in first tile.")
 
@@ -49,8 +50,11 @@ def parse_args():
     parser.add_argument('--log-level',
         type = int,
         default = 30)
-
-    args = parser.parse_args()
+    if arguments is None:
+        #normal argparse behavior
+        arguments = sys.argv[1:]
+    print(arguments)
+    args = parser.parse_args(arguments)
     logger.setLevel(args.log_level)
 
     return args
@@ -67,13 +71,19 @@ def refine_schema(schema : pa.Schema) -> Dict[str,pa.Schema]:
             t = pa.dictionary(pa.int16(), pa.utf8())
             fields[el.name] = t
 #            el = pa.field(el.name, t)
-        elif pa.types.is_float64(el.type):
+        elif pa.types.is_float64(el.type) or pa.types.is_float32(el.type):
             fields[el.name] = pa.float32()
-#            el = pa.field(el.name, pa.float32())
         elif el.name == "ix":
             fields[el.name] = pa.uint64()
             seen_ix = True
+        elif pa.types.is_integer(el.type):
+            fields[el.name] = pa.float32()
+        elif pa.types.is_large_string(el.type) or pa.types.is_string(el.type):
+            fields[el.name] = pa.string()
+        elif pa.types.is_boolean(el.type):
+            fields[el.name] = pa.float32()
         else:
+            raise TypeError(f"Unsupported type {el.type}")
             fields[el.name] = el.type
             #fields.append(el)
     if not seen_ix:
@@ -103,13 +113,15 @@ def determine_schema(args):
             t = pa.float32()
         if t == pa.float64():
             t = pa.float32()
+        if t == pa.large_string():
+            t = pa.string()
         if isinstance(t, pa.DictionaryType) and pa.types.is_string(t.value_type):
             t = pa.dictionary(pa.int16(), pa.utf8())
         schema[el.name] = t
         if el.name in override:
             schema[el.name] = getattr(pa, override[el.name])()
 
-    schema_safe = dict([(k, v if not pa.types.is_dictionary(v) else pa.string())for k, v in schema.items()])
+    schema_safe = dict([(k, v if not pa.types.is_dictionary(v) else pa.string()) for k, v in schema.items()])
     return schema, schema_safe
 
 
@@ -143,10 +155,10 @@ def rewrite_in_arrow_format(files, schema_safe, schema):
             # and converting each batch to dictionary as we go.
             d = dict()
             for i, name in enumerate(batch.schema.names):
-                if pa.types.is_dictionary(schema[name]):
-                    d[name] = batch[i].dictionary_encode()
-                else:
-                    d[name] = batch[i]
+                if pa.types.is_dictionary(schema[name]): ###
+                    d[name] = batch[i].dictionary_encode() ###
+                else: ###
+                    d[name] = batch[i] ###
             data = pa.Table.from_batches([batch])
             # Count each element in a uint64 array (float32 risks overflow,
             # Uint32 supports up to 2 billion or so, which is cutting it close for stars.)
@@ -183,17 +195,24 @@ files_open : Set[str] = set()
 # Will be overwritten from args
 
 
-def main():
-    args = parse_args()
+def main(arguments = None):
+    args = parse_args(arguments)
+    print(logger.level)
+    logger.info("hi")
     if (args.files[0].endswith(".csv") or args.files[0].endswith(".csv.gz")):
+        print("YEP")
         schema, schema_safe = determine_schema(args)
+        print("YEP")
         # currently the dictionary type isn't supported while reading CSVs.
         # So we have to do some monkey business to store it as keys at first, then convert to dictionary later.
         logger.info("Parsing with schema:")
+        logger.info("FFFOOOOO")
+        print(schema)
         logger.info(schema)
         rewritten_files, extent, raw_schema = rewrite_in_arrow_format(args.files, schema_safe, schema)
         logger.info("Done with preliminary build")
     else:
+        print("NOPE")
         rewritten_files = args.files
         if args.limits[0] > 1e8:
             if len(args.files) > 1:
@@ -218,7 +237,6 @@ def main():
         schema = refine_schema(raw_schema)
         elements = {name : type for name, type in schema.items()}
         if not "ix" in elements:
-            print("foo\n\n")
             elements['ix'] = pa.uint64()
         raw_schema = pa.schema(elements)
 
