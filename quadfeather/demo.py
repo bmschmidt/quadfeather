@@ -1,6 +1,6 @@
 import numpy as np
 from numpy import random
-from random import choice
+from random import choice, shuffle
 import pandas as pd
 import sys
 
@@ -15,7 +15,6 @@ for y in range(1900, 2020):
       dates.append(f"{y}-{m:02d}-{d:02d}")
 
 def main(path = "tmp.csv"):
-  
   try:
     SIZE = int(sys.argv[1])
   except:
@@ -33,8 +32,13 @@ def main(path = "tmp.csv"):
       date = random.choice(dates)
       frame = pd.DataFrame({
         "x": x, "y": y, "class": c,
-        "date": date,
-        "quantity": random.random(SIZE // 4)})
+        "quantity": random.random(SIZE // 4),
+        "date": date
+        })
       frames.append(frame)
 
-  pd.concat(frames).sample(frac = 1).to_csv(path, index = False)
+
+  frames = pd.concat(frames).sample(frac = 1)
+  # Add an unseen level at the very end.
+  frames.iloc[-1, -1] = "2040-01-01"
+  frames.to_csv(path, index = False)

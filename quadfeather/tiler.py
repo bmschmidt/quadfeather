@@ -53,7 +53,6 @@ def parse_args(arguments = None):
     if arguments is None:
         #normal argparse behavior
         arguments = sys.argv[1:]
-    print(arguments)
     args = parser.parse_args(arguments)
     logger.setLevel(args.log_level)
 
@@ -132,8 +131,13 @@ def determine_schema(args):
 # the data bounds and some other stuff; and it will be much faster to re-parse
 # everything from arrow than from CSV.
 
-def rewrite_in_arrow_format(files, schema_safe, schema):
+def rewrite_in_arrow_format(files, schema_safe : pa.Schema, 
+        schema : pa.Schema, csv_block_size : int = 1024*1024*128):
     # Returns: an extent and a list of feather files.
+    # files: a list of csvs
+    # schema_safe: the output schema (with no dictionary types)
+    # schema: the input schema (with dictionary types)
+    # csv_block_size: the block size to use when reading the csv files.
 
     ix = 0
     extent = {
@@ -146,7 +150,7 @@ def rewrite_in_arrow_format(files, schema_safe, schema):
 
     rewritten_files = []
     for FIN in files:
-        vals = csv.open_csv(FIN, csv.ReadOptions(block_size = 1024*1024*128),
+        vals = csv.open_csv(FIN, csv.ReadOptions(block_size = csv_block_size),
                                 convert_options = csv.ConvertOptions(
                                     column_types = schema_safe))
         for chunk_num, batch in enumerate(vals):
@@ -195,24 +199,23 @@ files_open : Set[str] = set()
 # Will be overwritten from args
 
 
-def main(arguments = None):
+def main(arguments = None, csv_block_size = 1024*1024*128):
+    """
+    Run a tiler
+
+    arguments: a list of strings to parse. If None, treat as command line args.
+    csv_block_size: the block size to use when reading the csv files. The default should be fine,
+        but included here to allow for testing multiple blocks.
+    """
     args = parse_args(arguments)
-    print(logger.level)
-    logger.info("hi")
     if (args.files[0].endswith(".csv") or args.files[0].endswith(".csv.gz")):
-        print("YEP")
         schema, schema_safe = determine_schema(args)
-        print("YEP")
         # currently the dictionary type isn't supported while reading CSVs.
         # So we have to do some monkey business to store it as keys at first, then convert to dictionary later.
-        logger.info("Parsing with schema:")
-        logger.info("FFFOOOOO")
-        print(schema)
         logger.info(schema)
-        rewritten_files, extent, raw_schema = rewrite_in_arrow_format(args.files, schema_safe, schema)
+        rewritten_files, extent, raw_schema = rewrite_in_arrow_format(args.files, schema_safe, schema, csv_block_size)
         logger.info("Done with preliminary build")
     else:
-        print("NOPE")
         rewritten_files = args.files
         if args.limits[0] > 1e8:
             if len(args.files) > 1:
@@ -295,7 +298,7 @@ def main(arguments = None):
 
     # Reflush every tile; bottom-up recursion.
     tiler.final_flush()
-    print("Job complete.")
+    logger.info("Job complete.")
 
     count = 0
     flushed = 0
