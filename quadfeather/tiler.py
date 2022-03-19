@@ -81,6 +81,8 @@ def refine_schema(schema : pa.Schema) -> Dict[str,pa.Schema]:
             fields[el.name] = pa.string()
         elif pa.types.is_boolean(el.type):
             fields[el.name] = pa.float32()
+        elif pa.types.is_date32(el.type):
+            fields[el.name] = pa.date32()
         else:
             raise TypeError(f"Unsupported type {el.type}")
             fields[el.name] = el.type
