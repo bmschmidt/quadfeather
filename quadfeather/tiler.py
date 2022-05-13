@@ -1,6 +1,5 @@
 import pyarrow as pa
-from pyarrow import csv, feather
-import pyarrow.compute as pc
+from pyarrow import csv, feather, parquet as pq, compute as pc
 #import pandas as pd
 import logging
 import shutil
@@ -13,6 +12,7 @@ from collections import defaultdict, Counter
 from typing import DefaultDict, Dict, List, Tuple, Set
 import numpy as np
 import sys
+from .ingester import get_ingester
 
 logger = logging.getLogger("quadtiler")
 
@@ -21,7 +21,7 @@ def parse_args(arguments = None):
     parser.add_argument('--first_tile_size', type=int, default = 1000, help ="Number of records in first tile.")
 
     parser.add_argument('--tile_size', type=int, default = 50000, help ="Number of records per tile.")
-    parser.add_argument('--destination', '--directory', '-d', type=str, required = True, help = "Destination directory to write to.")
+    parser.add_argument('--destination', '--directory', '-d', type=Path, required = True, help = "Destination directory to write to.")
     parser.add_argument('--max_files',
         type=float,
         default = 25,
@@ -32,7 +32,7 @@ def parse_args(arguments = None):
                         "of coincident points, can reduce the depth of teh tree greatly.")
 
     parser.add_argument('--files', "-f", nargs = "+",
-                        type = str,
+                        type = Path,
                         help="""Input file(s). If .csv, indexes will be assigned; if .arrow or .feather, assumed that 'ix' is present. Must be in sorted order.""")
 
     parser.add_argument('--limits', nargs = 4,
@@ -150,7 +150,7 @@ def rewrite_in_arrow_format(files, schema_safe : pa.Schema,
     if "z" in schema.keys():
         extent["z"] = [float("inf"), -float("inf")]
 
-    rewritten_files = []
+    rewritten_files : list[Path] = []
     for FIN in files:
         vals = csv.open_csv(FIN, csv.ReadOptions(block_size = csv_block_size),
                                 convert_options = csv.ConvertOptions(
@@ -178,7 +178,7 @@ def rewrite_in_arrow_format(files, schema_safe : pa.Schema,
             final_table = pa.table(d)
             fname = f"{chunk_num}.feather"
             feather.write_feather(final_table, fname, compression = "zstd")
-            rewritten_files.append(fname)
+            rewritten_files.append(Path(fname))
     raw_schema = final_table.schema
     return rewritten_files, extent, raw_schema
     # Learn the schema from the last file written out.
@@ -210,7 +210,7 @@ def main(arguments = None, csv_block_size = 1024*1024*128):
         but included here to allow for testing multiple blocks.
     """
     args = parse_args(arguments)
-    if (args.files[0].endswith(".csv") or args.files[0].endswith(".csv.gz")):
+    if (args.files[0].suffix == '.csv' or str(args.files[0]).endswith(".csv.gz")):
         schema, schema_safe = determine_schema(args)
         # currently the dictionary type isn't supported while reading CSVs.
         # So we have to do some monkey business to store it as keys at first, then convert to dictionary later.
@@ -218,17 +218,23 @@ def main(arguments = None, csv_block_size = 1024*1024*128):
         rewritten_files, extent, raw_schema = rewrite_in_arrow_format(args.files, schema_safe, schema, csv_block_size)
         logger.info("Done with preliminary build")
     else:
+
         rewritten_files = args.files
         if args.limits[0] > 1e8:
             if len(args.files) > 1:
                 logger.warning("Checking limits for bounding box but only on first passed file, i.e., " + args.files[0])
-            xy = feather.read_table(args.files[0], columns=["x", "y"])
-            x = pc.min_max(xy['x']).as_py()
-            y = pc.min_max(xy['y']).as_py()
-            extent = {
-                "x": [x['min'], x['max']],
-                "y": [y['min'], y['max']]
-            }
+            fin = args.files[0]
+            if fin.suffix == ".feather" or fin.suffix == ".parquet":
+                if fin.suffix == ".feather":
+                    xy = feather.read_table(fin, columns=["x", "y"])
+                elif fin.suffix == '.parquet':
+                    xy = pq.read_table(fin, columns = ['x', 'y'])
+                x = pc.min_max(xy['x']).as_py()
+                y = pc.min_max(xy['y']).as_py()
+                extent = {
+                    "x": [x['min'], x['max']],
+                    "y": [y['min'], y['max']]
+                }
         else:
             extent = {
                 "x": [args.limits[0], args.limits[2]],
@@ -237,8 +243,12 @@ def main(arguments = None, csv_block_size = 1024*1024*128):
 
         logger.info("extent")
         logger.info(extent)
-        first_batch = pa.ipc.RecordBatchFileReader(args.files[0])
-        raw_schema = first_batch.schema
+        if args.files[0].suffix == '.feather':
+            first_batch = pa.ipc.RecordBatchFileReader(args.files[0])
+            raw_schema = first_batch.schema
+        elif args.files[0].suffix == '.parquet':
+            first_batch = pq.ParquetFile(args.files[0])
+            raw_schema = first_batch.schema_arrow
         schema = refine_schema(raw_schema)
         elements = {name : type for name, type in schema.items()}
         if not "ix" in elements:
@@ -258,9 +268,8 @@ def main(arguments = None, csv_block_size = 1024*1024*128):
             recoders[field.name] = get_recoding_arrays(rewritten_files, field.name)
 
     count_read = 0
-    for i, arrow_block in enumerate(rewritten_files):
-        logging.info(f"Reading block {i} of {len(rewritten_files) - 1}")
-        tab = feather.read_table(arrow_block)
+    ingester = get_ingester(rewritten_files)
+    for i, tab in enumerate(ingester):
         if not "ix" in tab.schema.names:
             tab = tab.append_column("ix", pa.array(range(count_read, count_read + len(tab)), pa.uint64()))
             count_read += len(tab)

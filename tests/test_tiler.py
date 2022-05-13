@@ -40,7 +40,6 @@ class TestCSV():
     demo_main(tmp_path / "test.csv")
     main(["--files", str(tmp_path / "test.csv"), '--destination', str(tmp_path / "tiles"), '--dtypes', 'date=string'], csv_block_size = 4096)
 
-
   def test_if_break_categorical_chunks(self, tmp_path):
     input = tmp_path / "test.csv"
     with input.open("w") as fout:
@@ -52,3 +51,7 @@ class TestCSV():
 
     main(["--files", str(input), '--destination', str(tmp_path / "tiles"),
      '--dtypes', 'cat=string'], csv_block_size = 1024)
+
+
+class TestParquet():
+  pass  
