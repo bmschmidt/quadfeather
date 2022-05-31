@@ -1,5 +1,5 @@
 import pyarrow as pa
-from pyarrow import csv, feather, parquet as pq, compute as pc
+from pyarrow import csv, feather, parquet as pq, compute as pc, ipc as ipc
 #import pandas as pd
 import logging
 import shutil
@@ -12,8 +12,8 @@ from collections import defaultdict, Counter
 from typing import DefaultDict, Dict, List, Tuple, Set
 import numpy as np
 import sys
+from math import isfinite, sqrt
 from .ingester import get_ingester
-
 logger = logging.getLogger("quadtiler")
 
 def parse_args(arguments = None):
@@ -25,11 +25,12 @@ def parse_args(arguments = None):
     parser.add_argument('--max_files',
         type=float,
         default = 25,
-        help = "Max files to have open. Default 25; check ulimit -n to see what might be safe. "
-               "Usually it's much faster to have significantly fewer files than the max.")
+        help = "Max files to have open at once. Default 25. "
+               "Usually it's much faster to have significantly fewer files than the max allowed open by the system "
+    )
     parser.add_argument('--randomize', type=float, default = 0,
-                        help ="Uniform random noise to add to points. If you have millions"
-                        "of coincident points, can reduce the depth of teh tree greatly.")
+                        help ="Uniform random noise to add to points. If you have millions "
+                        "of coincident points, can reduce the depth of the tree greatly.")
 
     parser.add_argument('--files', "-f", nargs = "+",
                         type = Path,
@@ -86,7 +87,6 @@ def refine_schema(schema : pa.Schema) -> Dict[str,pa.Schema]:
         else:
             raise TypeError(f"Unsupported type {el.type}")
             fields[el.name] = el.type
-            #fields.append(el)
     if not seen_ix:
         fields["ix"] = pa.uint64()
     return fields
@@ -146,7 +146,8 @@ def rewrite_in_arrow_format(files, schema_safe : pa.Schema,
         "x": [float("inf"), -float("inf")],
         "y": [float("inf"), -float("inf")],
     }
-
+    output_dir = files[0].parent / "_deepscatter_tmp"
+    output_dir.mkdir()
     if "z" in schema.keys():
         extent["z"] = [float("inf"), -float("inf")]
 
@@ -176,9 +177,9 @@ def rewrite_in_arrow_format(files, schema_safe : pa.Schema,
                 extent[dim][0] = min(extent[dim][0], zoo['min'])
                 extent[dim][1] = max(extent[dim][1], zoo['max'])
             final_table = pa.table(d)
-            fname = f"{chunk_num}.feather"
-            feather.write_feather(final_table, fname, compression = "zstd")
-            rewritten_files.append(Path(fname))
+            fout = output_dir / f"{chunk_num}.feather"
+            feather.write_feather(final_table, fout, compression = "zstd")
+            rewritten_files.append(fout)
     raw_schema = final_table.schema
     return rewritten_files, extent, raw_schema
     # Learn the schema from the last file written out.
@@ -191,8 +192,6 @@ def check_filesnames(args):
             raise TypeError(f"Must pass all the same type of file as input, not {f}/{f[0]}")
     if not f in set(["arrow", "feather", "csv", "gz"]):
         raise TypeError("Must use files ending in 'feather', 'arrow', or '.csv'")
-
-# Memory tiles *might* be flushed into overflow mode, so we count them.
 
 # Start at one to count the initial tile. (This number is incremented when children are built.)
 memory_tiles_open : Set[str] = set()
@@ -210,30 +209,39 @@ def main(arguments = None, csv_block_size = 1024*1024*128):
         but included here to allow for testing multiple blocks.
     """
     args = parse_args(arguments)
+    dirs_to_cleanup = []
     if (args.files[0].suffix == '.csv' or str(args.files[0]).endswith(".csv.gz")):
         schema, schema_safe = determine_schema(args)
         # currently the dictionary type isn't supported while reading CSVs.
         # So we have to do some monkey business to store it as keys at first, then convert to dictionary later.
         logger.info(schema)
         rewritten_files, extent, raw_schema = rewrite_in_arrow_format(args.files, schema_safe, schema, csv_block_size)
+        dirs_to_cleanup.append(rewritten_files[0].parent)
         logger.info("Done with preliminary build")
     else:
-
         rewritten_files = args.files
-        if args.limits[0] > 1e8:
-            if len(args.files) > 1:
-                logger.warning("Checking limits for bounding box but only on first passed file, i.e., " + args.files[0])
+        if not isfinite(args.limits[0]):
             fin = args.files[0]
             if fin.suffix == ".feather" or fin.suffix == ".parquet":
-                if fin.suffix == ".feather":
-                    xy = feather.read_table(fin, columns=["x", "y"])
-                elif fin.suffix == '.parquet':
-                    xy = pq.read_table(fin, columns = ['x', 'y'])
-                x = pc.min_max(xy['x']).as_py()
-                y = pc.min_max(xy['y']).as_py()
+                reader = get_ingester(args.files)
+                xmin = args.limits[0]
+                ymin = args.limits[1]
+                xmax = args.limits[2]
+                ymax = args.limits[3]
+                for batch in reader:
+                    x = pc.min_max(batch['x']).as_py()
+                    y = pc.min_max(batch['y']).as_py()
+                    if x['min'] < xmin and isfinite(x['min']):
+                        xmin = x['min']
+                    if x['max'] > xmax and isfinite(x['max']):
+                        xmax = x['max']
+                    if y['min'] < ymin and isfinite(y['min']):
+                        ymin = y['min']
+                    if y['max'] > ymax and isfinite(y['max']):
+                        ymax = y['max']
                 extent = {
-                    "x": [x['min'], x['max']],
-                    "y": [y['min'], y['max']]
+                    "x": [xmin, xmax],
+                    "y": [ymin, ymax]
                 }
         else:
             extent = {
@@ -244,7 +252,7 @@ def main(arguments = None, csv_block_size = 1024*1024*128):
         logger.info("extent")
         logger.info(extent)
         if args.files[0].suffix == '.feather':
-            first_batch = pa.ipc.RecordBatchFileReader(args.files[0])
+            first_batch = ipc.RecordBatchFileReader(args.files[0])
             raw_schema = first_batch.schema
         elif args.files[0].suffix == '.parquet':
             first_batch = pq.ParquetFile(args.files[0])
@@ -255,7 +263,6 @@ def main(arguments = None, csv_block_size = 1024*1024*128):
             elements['ix'] = pa.uint64()
         raw_schema = pa.schema(elements)
 
-    tiler = Tile(extent, [0, 0, 0], args)
 
     logging.info("Starting.")
 
@@ -268,58 +275,12 @@ def main(arguments = None, csv_block_size = 1024*1024*128):
             recoders[field.name] = get_recoding_arrays(rewritten_files, field.name)
 
     count_read = 0
-    ingester = get_ingester(rewritten_files)
-    for i, tab in enumerate(ingester):
-        if not "ix" in tab.schema.names:
-            tab = tab.append_column("ix", pa.array(range(count_read, count_read + len(tab)), pa.uint64()))
-            count_read += len(tab)
-        # tab = tab.filter(pc.invert(pc.is_null(tab['x'])))
 
-        # Drop missing x values, silently
-        d = dict()
-        for t in tab.schema.names:
-            if t in recoders:
-                d[t] = remap_all_dicts(tab[t], *recoders[t])
-            d[t] = tab[t]
+    tiler = Tile(extent, [0, 0, 0], args)
+    tiler.insert_files(files = rewritten_files, schema = schema, recoders = recoders)
 
-        if args.randomize > 0:
-            d['x'] = pc.add(d['x'], nprandom.normal(0, args.randomize, tab.shape[0]))
-            d['y'] = pc.add(d['y'], nprandom.normal(0, args.randomize, tab.shape[0]))
-
-
-        tab = pa.table(d).combine_chunks()
-
-        logger.info(f"{len(memory_tiles_open)} partially filled tiles buffered in memory and {len(files_open)} flushing overflow directly to disk.")
-        remaining_tiles = args.max_files - len(memory_tiles_open) - len(files_open)
-        logger.info(f"Inserting block {i} of {len(rewritten_files) - 1}")
-
-        tiler.insert(tab, remaining_tiles)
-        logger.info(f"Done inserting block {i} of {len(rewritten_files) - 1}")
-
-#    final_dictionaries = make_final_dictionaries(count_holder)
-
-    logger.info("Initial partition complete--proceeding to children.")
-
-    # Flush all open tiles that are not overflown.
-    tiler.map_tiles(lambda tile: tile.first_flush())
-
-    # Works recursively lower down, including first flush for all newly created children.
-    # Top down recursion.
-    tiler.retry_overflown_buffers(args.max_files)
-
-    # Reflush every tile; bottom-up recursion.
-    tiler.final_flush()
     logger.info("Job complete.")
-
-    count = 0
-    flushed = 0
-
-    for (coords, count_here, flushed_here) in tiler.summary():
-        count += count_here
-        flushed += flushed_here
-
-    logger.info(f"{count} added, {flushed} flushed")
-    logger.debug(memory_tiles_open)
+    
 
 def partition(table: pa.Table, midpoint: Tuple[str, float]) -> List[pa.Table]:
     # Divide a table in two based on a midpoint
@@ -332,8 +293,7 @@ def partition(table: pa.Table, midpoint: Tuple[str, float]) -> List[pa.Table]:
 class Tile():
     # some prep to make OCT_TREE SAFE--METHODS that support only quads
     # listed as QUAD_ONLY
-    def __init__(self, extent, coords, args):
-        global memory_tiles_open
+    def __init__(self, extent, coords, args, writer_budget = None):
 
         self.coords = coords
         self.extent = extent
@@ -342,11 +302,13 @@ class Tile():
         self.first_tile_size = args.first_tile_size
         self.tile_size = args.tile_size
         self.schema = None
-
+        if writer_budget is None:
+          self.writer_budget = args.max_files
         # Wait to actually create the directories until needed.
         self._filename = None
         self._children = None
-        self._overflow_buffer = None
+        self._overflow_writer = None
+        self._sink = None
         # Unwritten records for myself.
         self.data : List[pa.RecordBatch] = []
         # Unwritten records for my children.
@@ -354,20 +316,61 @@ class Tile():
 
         self.n_data_points = 0
         self.n_flushed = 0
-
-        self.flush_status = "unflushed"
-        memory_tiles_open.add(self.filename)
-
+        self.total_points = 0
+    
+    def insert_files(self, files, recoders = {}, schema = None, randomize = 0, destructively = False):
+      """
+      given a list of files, inser them into the tree at this point.
+      """
+      ingester = get_ingester(files, destructive = destructively)
+      count_read = 0
+      if schema is None:
+        schema = self.schema
+      elif type(schema == dict):
+        schema = pa.schema(schema)
+      for i, tab in enumerate(ingester):
+        # Would only happen on the first insertion, so safe to do in order.
+        count_read += len(tab)
+        if not "ix" in tab.schema.names:
+          tab = tab.append_column("ix", pa.array(range(count_read, count_read + len(tab)), pa.uint64()))
+        d = dict()
+        # Remap values if necessary.
+        for t in tab.schema.names:
+            if t in recoders:
+                d[t] = remap_all_dicts(tab[t], *recoders[t])
+            d[t] = tab[t]
+        if randomize > 0:
+            rho = nprandom.normal(0, args.randomize, tab.shape[0])
+            theta = nprandom.uniform(0, 2 * np.pi, tab.shape[0])
+            d['x'] = pc.add(d['x'], pc.multiply(rho, pc.cos(theta)))
+            d['y'] = pc.add(d['y'], pc.multiply(rho, pc.sin(theta)))
+        tab = pa.table(d, schema = schema)
+        self.insert_table(tab)
+      for tile in self.iterate(direction = "top-down"):
+        # Freeze local and overflow tables to disk.
+        tile.first_flush()
+      for tile in self.iterate(direction = "top-down"):
+        if tile.overflow_loc.exists():
+          tile.insert_files([tile.overflow_loc], destructively = True)
+      n_complete = 0
+      for tile in self.iterate(direction = "bottom-up"):
+        n_complete += tile.final_flush()
+      logger.info(f"{n_complete} tiles flushed from {self.coords}")
 
     def __repr__(self):
         return f"Tile:\nextent: {self.extent}\ncoordinates:{self.coords}"
 
     @property
     def TILE_SIZE(self):
-        if self.coords[0] == 0:
-            return self.args.first_tile_size
+        depth = self.coords[0]
+        if depth == 0:
+          return self.args.first_tile_size
+        elif depth == 1:
+          # geometric mean of first and second
+          return int(sqrt(self.args.tile_size * self.args.first_tile_size))
         else:
-            return self.args.tile_size
+          return self.args.tile_size
+
     def midpoints(self) -> List[Tuple[str, float]]:
         midpoints : List[Tuple[str, float]] = []
         for k, lim in self.extent.items():
@@ -390,26 +393,24 @@ class Tile():
 
     def first_flush(self):
         # Ensure this function is only ever called once.
+        if self.data is not None and len(self.data) > 0:
+            destination = self.filename.with_suffix(".needs_metadata.feather")
+            n_written = self.flush_data(destination, {}, "zstd", expect_table = False)
+            self.data = None
+        if self._overflow_writer is not None:          
+          self._overflow_writer.close()
+          self._sink.close()
+          self._overflow_writer = None
 
-        if self.flush_status == "needs metadata":
-            return
-        self.flush_status = "needs metadata"
-
-        global memory_tiles_open
-
-        if self.n_data_points == 0:
-            memory_tiles_open.remove(self.filename)
-            return
-        destination = self.filename.with_suffix(".needs_metadata.feather")
-        self.flush_data(destination, {}, "zstd", expect_table = False)
-        memory_tiles_open.remove(self.filename)
-
-    def final_flush(self) -> None:
+    def final_flush(self) -> int:
         """
         At the end, we can see which tiles have children and append that
         to the metadata.
+
+        Returns the number of rows below this point.
         """
-        self.total_points = 0
+        if self.total_points > 0:
+            return self.total_points
         metadata = {
             "extent": json.dumps({k : [float(f) for f in v] for k, v in self.extent.items()}),
         }
@@ -418,38 +419,34 @@ class Tile():
             metadata["children"] = "[]"
         else:
             for child in self._children:
-                child.final_flush()
                 self.total_points += child.total_points
             populated_kids = [c.id for c in self._children if c.total_points > 0]
             metadata["children"] = json.dumps(populated_kids)
 
         unclean_path = self.filename.with_suffix(".needs_metadata.feather")
-
-
-        try:
-            self.data = feather.read_table(unclean_path)
-
-        except FileNotFoundError:
-            if self._children == None:
-                return
-            else:
-                raise FileNotFoundError("Couldn't find file even though children exist.")
-#        for batch in self.data:
-#            self.total_points += batch.num_rows
-        self.total_points += self.data.shape[0]
+        if not unclean_path.exists():
+           assert self.total_points == 0
+           return 0
+        self.data = feather.read_table(unclean_path)
+        if self.coords[0] == 0:
+            pass
+        self.total_points += len(self.data)
         metadata["total_points"] = str(self.total_points)
         schema = pa.schema(self.schema, metadata = metadata)
-        self.flush_data(self.filename, metadata, "uncompressed", schema, expect_table = True)
-        share = self.coords[1] / (2**self.coords[0])
-        share_rep = int(share * 80)
-        print(f"Final Flush: {'=' * share_rep}{'-'*(80-share_rep)} {self.coords}", end = "\r")
+        n_flushed = self.flush_data(self.filename, metadata, "uncompressed", schema, expect_table = True)
         unclean_path.unlink()
+        return self.total_points
 
-    def flush_data(self, destination, metadata, compression, schema = None, expect_table = False):
+    def flush_data(self, destination, metadata, compression, schema = None, expect_table = False) -> int:
+        """
+        Flushes the locally stored data to disk
+
+        Returns the number of points written.
+        """
         if self.data is None:
-            return
+            return 0
 
-        if expect_table:
+        if expect_table and type(self.data) == pa.table:
             frame = self.data.replace_schema_metadata(metadata)
         else:
             if schema is None:
@@ -459,20 +456,23 @@ class Tile():
 
         feather.write_feather(frame, destination, compression = compression)
         self.data = None
+        return len(frame)
 
     @property
+    def overflow_loc(self):
+      return self.filename.with_suffix(".overflow.arrow")
+    @property
     def overflow_buffer(self):
-        global files_open
-        if self._overflow_buffer:
-            return self._overflow_buffer
-        logger.debug(f"Opening overflow on {self.coords}")
-
-        fname = self.filename.with_suffix(".overflow.arrow")
-        if fname.exists():
-            fname.unlink()
-        self._overflow_buffer = pa.ipc.new_file(fname, self.schema)
-        files_open.add(fname)
-        return self._overflow_buffer
+        if self._overflow_writer:
+            return self._overflow_writer
+        logger.debug(f"Opening overflow on {self.coords}")        
+        if self.overflow_loc.exists():
+            raise FileExistsError(f"Overflow file already exists: {fname}")
+        self._sink = pa.OSFile(str(self.overflow_loc), 'wb')
+        self._overflow_writer = \
+            pa.ipc.new_file(self._sink, self.schema)
+        pass
+        return self._overflow_writer
 
     def partition_to_children(self, table) -> List[pa.Table]:
         # Coerce to a list in quadtree/octree order.
@@ -485,21 +485,15 @@ class Tile():
             frames = expanded
         return frames
 
-
-    def last_check(self):
-        logger.info(f"Finishing: flushed {self.total_points}")
-
     @property
     def children(self):
         if self._children is not None:
             return self._children
-
         return self.make_children()
 
     def make_children(self):
         # QUAD ONLY
 
-        global memory_tiles_open
         # Calling this forces child creation even when it's not wise.
         self._children = []
         midpoints = self.midpoints()
@@ -516,89 +510,32 @@ class Tile():
                 self._children.append(child)
         return self._children
 
-    def map_tiles(self, function):
-        # Apply a function to this tile and all children.
-        output = [function(self)]
-        if self._children:
-            for child in self._children:
-                output += child.map_tiles(function)
-        return output
+    def iterate(self, direction):
+      # iterate over the children in the given direction.
+      assert direction in ["top-down", "bottom-up"]
+      if direction == "top-down":
+        yield self
+      if self._children is not None:
+        for child in self._children:
+          yield from child.iterate(direction)
+      if direction == "bottom-up":
+        yield self
 
     @property
     def id(self):
         return "/".join(map(str,self.coords))
-
-    def summary(self):
-        return self.map_tiles(lambda x: (x.coords, x.total_points, x.n_flushed))
-
-    def close_overflow_buffers(self):
-        # Close all open overflow buffers.
-        global files_open
-        if self._overflow_buffer:
-            if self.filename.with_suffix(".overflow.arrow") in files_open:
-                self._overflow_buffer.close()
-                files_open.remove(self.filename.with_suffix(".overflow.arrow"))
-
-        if self._children:
-            for child in self._children:
-                child.close_overflow_buffers()
-
-
-
-    def retry_overflown_buffers(self, absolute_max_files):
-        # Find all overflown buffers and flush them out.
-        # Recursive.
-
-        # Reinsert from a node that has been closed to children.
-        self.close_overflow_buffers()
-
-        if self._overflow_buffer:
-            # If there's an overflow buffer, _children will have been
-            # banned.
-            self._children = []
-            fname = self.filename.with_suffix(".overflow.arrow")
-            fin = pa.ipc.RecordBatchFileReader(open(fname, "rb"))
-
-            # Force child creation, even if we've got a few too many open right now.
-
-            tile_budget = absolute_max_files - len(memory_tiles_open) - len(files_open)
-            if tile_budget < 4:
-                logger.warning(f"Warning--overriding tile budget on {self.coords} to force child creation.")
-                tile_budget = 4
-            self.make_children()
-
-            logger.debug(f"Flushing {fin.num_record_batches} batches from {self.coords} with budget of {tile_budget} ({len(files_open)} memory, {len(memory_tiles_open)} tiles waiting to flush in memory)")
-            current_batches = []
-            current_size = 0
-            for i in range(fin.num_record_batches):
-                batch = fin.get_batch(i)
-                current_batches.append(batch)
-                current_size += batch.nbytes
-                # Flush the last time, and every 256 megabytes. number chosen arbitrarily.
-                if i == fin.num_record_batches - 1 or current_size > (256 * 1024 * 1024):
-                    self.insert(pa.Table.from_batches(current_batches).combine_chunks(), tile_budget)
-                    current_batches = []
-                    current_size = 0
-            fname.unlink()
-            self._overflow_buffer = None
-            # Now we're writing to this tile again.
-        if self._children:
-            self.map_tiles(lambda tile: tile.first_flush())
-
-            for child in self._children:
-                tile_budget = absolute_max_files - len(memory_tiles_open) - len(files_open)
-                child.retry_overflown_buffers(absolute_max_files)
-
+        
     def check_schema(self, table):
         if (self.schema is None):
             self.schema = table.schema
             return
         if not self.schema.equals(table.schema):
+            logger.error("INSERTING:", table.schema)
+            logger.error("OWN SCHEMA", self.schema)
             raise TypeError("Attempted to insert a table with a different schema.")
 
-    def insert(self, table, tile_budget = float("Inf")):
+    def insert_table(self, table, tile_budget = float("Inf")):
         self.check_schema(table)
-        #logging.debug(f"Inserting to {self.coords} with budget of {tile_budget}")
         insert_n_locally = self.TILE_SIZE - self.n_data_points
         if (insert_n_locally > 0):
             local_mask = np.zeros((table.shape[0]), bool)
@@ -608,13 +545,16 @@ class Tile():
                 for batch in head.to_batches():
                     self.data.append(batch)
                 self.n_data_points += head.shape[0]
+            # All *unwritten* rows are now mapped into the main table to
+            # flow into the children.
             table = table.filter(pc.invert(local_mask))
             if self.n_data_points == self.TILE_SIZE:
                 # We've only just completed. Flush.
                 self.first_flush()
         else:
             pass
-
+        
+        # 4, for quadtrees.
         children_per_tile = 2**(len(self.coords) - 1)
         if tile_budget >= children_per_tile or self._children is not None:
             # If we can afford to create children, do so.
@@ -638,7 +578,7 @@ class Tile():
                 tiles_allowed = tile_budget * (subset.shape[0] / total_records) + tiles_allowed_overflow
                 tiles_allowed_overflow = tiles_allowed % children_per_tile
 
-                child_tile.insert(subset, tiles_allowed - tiles_allowed_overflow)
+                child_tile.insert_table(subset, tile_budget = tiles_allowed - tiles_allowed_overflow)
             return
         else:
             for batch in table.to_batches():
