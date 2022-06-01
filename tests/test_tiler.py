@@ -73,3 +73,8 @@ class TestParquet():
     main(["--files", str(tmp_path / "test.parquet"), '--destination', str(tmp_path / "tiles"), "--tile_size", "5000"])
     length = int(feather.read_table(tmp_path / "tiles" / "0/0/0.feather").schema.metadata[b'total_points'].decode("utf-8"))
     assert length == size
+    tb = feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
+    ps = tb['ix'].to_pylist()
+    assert ps[0] == 0
+    assert ps[1] == 1
+    assert ps[-1] == 999

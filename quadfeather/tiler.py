@@ -14,7 +14,7 @@ import numpy as np
 import sys
 from math import isfinite, sqrt
 from .ingester import get_ingester
-logger = logging.getLogger("quadtiler")
+logger = logging.getLogger("quadfeather")
 
 def parse_args(arguments = None):
     parser = argparse.ArgumentParser(description='Tile an input file into a large number of arrow files.')
@@ -323,16 +323,17 @@ class Tile():
       given a list of files, inser them into the tree at this point.
       """
       ingester = get_ingester(files, destructive = destructively)
-      count_read = 0
       if schema is None:
         schema = self.schema
       elif type(schema == dict):
         schema = pa.schema(schema)
+      logger.debug(f"starting insertion at {self.coords}")
+      count_read = 0
       for i, tab in enumerate(ingester):
         # Would only happen on the first insertion, so safe to do in order.
-        count_read += len(tab)
         if not "ix" in tab.schema.names:
           tab = tab.append_column("ix", pa.array(range(count_read, count_read + len(tab)), pa.uint64()))
+        count_read += len(tab)
         d = dict()
         # Remap values if necessary.
         for t in tab.schema.names:
@@ -345,13 +346,17 @@ class Tile():
             d['x'] = pc.add(d['x'], pc.multiply(rho, pc.cos(theta)))
             d['y'] = pc.add(d['y'], pc.multiply(rho, pc.sin(theta)))
         tab = pa.table(d, schema = schema)
-        self.insert_table(tab)
+        self.insert_table(tab, tile_budget = self.args.max_files)
+      logger.debug(f"starting flush from {self.coords}")
+
       for tile in self.iterate(direction = "top-down"):
         # Freeze local and overflow tables to disk.
         tile.first_flush()
+      logger.debug(f"first flush of {self.coords} complete")
       for tile in self.iterate(direction = "top-down"):
         if tile.overflow_loc.exists():
           tile.insert_files([tile.overflow_loc], destructively = True)
+      logger.debug(f"child insertion from {self.coords} complete")
       n_complete = 0
       for tile in self.iterate(direction = "bottom-up"):
         n_complete += tile.final_flush()
@@ -395,7 +400,7 @@ class Tile():
         # Ensure this function is only ever called once.
         if self.data is not None and len(self.data) > 0:
             destination = self.filename.with_suffix(".needs_metadata.feather")
-            n_written = self.flush_data(destination, {}, "zstd", expect_table = False)
+            n_written = self.flush_data(destination, {}, "zstd")
             self.data = None
         if self._overflow_writer is not None:          
           self._overflow_writer.close()
@@ -428,16 +433,14 @@ class Tile():
            assert self.total_points == 0
            return 0
         self.data = feather.read_table(unclean_path)
-        if self.coords[0] == 0:
-            pass
         self.total_points += len(self.data)
         metadata["total_points"] = str(self.total_points)
         schema = pa.schema(self.schema, metadata = metadata)
-        n_flushed = self.flush_data(self.filename, metadata, "uncompressed", schema, expect_table = True)
+        n_flushed = self.flush_data(self.filename, metadata, "uncompressed", schema)
         unclean_path.unlink()
         return self.total_points
 
-    def flush_data(self, destination, metadata, compression, schema = None, expect_table = False) -> int:
+    def flush_data(self, destination, metadata, compression, schema = None) -> int:
         """
         Flushes the locally stored data to disk
 
@@ -446,14 +449,15 @@ class Tile():
         if self.data is None:
             return 0
 
-        if expect_table and type(self.data) == pa.table:
+        if type(self.data) == pa.Table:
             frame = self.data.replace_schema_metadata(metadata)
-        else:
+        elif type(self.data) == list and type(self.data[0]) == pa.RecordBatch:
             if schema is None:
                 schema = self.schema
             schema_copy = pa.schema(self.data[0].schema, metadata = metadata)
             frame = pa.Table.from_batches(self.data, schema_copy).combine_chunks()
-
+        else:
+            raise ValueError(f"Unrecognized data type: {type(self.data)}")
         feather.write_feather(frame, destination, compression = compression)
         self.data = None
         return len(frame)
@@ -467,11 +471,10 @@ class Tile():
             return self._overflow_writer
         logger.debug(f"Opening overflow on {self.coords}")        
         if self.overflow_loc.exists():
-            raise FileExistsError(f"Overflow file already exists: {fname}")
+            raise FileExistsError(f"Overflow file already exists: {self.overflow_loc}")
         self._sink = pa.OSFile(str(self.overflow_loc), 'wb')
         self._overflow_writer = \
             pa.ipc.new_file(self._sink, self.schema)
-        pass
         return self._overflow_writer
 
     def partition_to_children(self, table) -> List[pa.Table]:
@@ -556,7 +559,8 @@ class Tile():
         
         # 4, for quadtrees.
         children_per_tile = 2**(len(self.coords) - 1)
-        if tile_budget >= children_per_tile or self._children is not None:
+        # Always use previously created _overflow writer
+        if not self._overflow_writer and (tile_budget >= children_per_tile or self._children is not None):
             # If we can afford to create children, do so.
             total_records = table.shape[0]
             if total_records == 0:
