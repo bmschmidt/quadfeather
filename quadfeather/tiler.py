@@ -596,8 +596,9 @@ def get_better_codes(col, counter = Counter()):
 
 def get_recoding_arrays(files, col_name):
     countered = Counter()
-    for file in files:
-        col = pa.feather.read_table(file, columns=[col_name])[col_name]
+    ingester = get_ingester(files, columns = [col_name])
+    for batch in ingester:
+        col = batch[col_name]
         countered = get_better_codes(col, countered)
     new_order = [pair[0] if pair[0] else "<NA>" for pair in countered.most_common(4094)]
     if len(new_order) == 4094:

@@ -1,6 +1,7 @@
 import pyarrow as pa
 from pyarrow import parquet as pq, feather, json as pajson, csv, ipc
 from pathlib import Path
+from typing import DefaultDict, Dict, List, Tuple, Set, Optional
 
 class Ingester:
   def __init__(self, files : list[Path], batch_size : int = 1024 * 1024 * 1024, columns = None, destructive = False):
@@ -55,14 +56,14 @@ class ParquetIngester(Ingester):
       if self.destructive:
         f.unlink()
 
-def get_ingester(files : list[Path], destructive = False) -> Ingester:
+def get_ingester(files : List[Path], destructive = False, columns : Optional[List[str]]= None) -> Ingester:
   assert len(set([f.suffix for f in files])) == 1, "All files must be of the same type"
   if files[0].suffix == ".parquet":
-    return ParquetIngester(files, destructive = destructive)
+    return ParquetIngester(files, destructive = destructive, columns = columns)
   elif files[0].suffix == ".feather":
-    return FeatherIngester(files, destructive = destructive)
+    return FeatherIngester(files, destructive = destructive, columns = columns)
   elif files[0].suffix == ".arrow":
     # This is the arrow IPC format, which can be slightly different (lacks a schema at the bottom.)
-    return ArrowIngester(files, destructive = destructive)
+    return ArrowIngester(files, destructive = destructive, columns = columns)
   else:
     raise Exception("Unsupported file type", files[0].suffix)
