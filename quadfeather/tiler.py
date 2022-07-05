@@ -9,7 +9,7 @@ import argparse
 import json
 from numpy import random as nprandom
 from collections import defaultdict, Counter
-from typing import DefaultDict, Dict, List, Tuple, Set
+from typing import DefaultDict, Dict, List, Tuple, Set, Optional
 import numpy as np
 import sys
 from math import isfinite, sqrt
@@ -34,19 +34,19 @@ def parse_args(arguments = None):
 
     parser.add_argument('--files', "-f", nargs = "+",
                         type = Path,
-                        help="""Input file(s). If .csv, indexes will be assigned; if .arrow or .feather, assumed that 'ix' is present. Must be in sorted order.""")
+                        help="""Input file(s). If column 'ix' defined, will be used: otherwise, indexes will be assigned. Must be in sorted order.""")
 
     parser.add_argument('--limits', nargs = 4,
                         type = float,
                         metavar = list,
                         default = [float("inf"), float("inf"), -float("inf"), -float("inf")],
-                        help="""Data limits, in [x0 y0 xmax ymax] order. If not entered, will be calculated.""")
+                        help="""Data limits, in [x0 y0 xmax ymax] order. If not entered, will be calculated at some cost.""")
 
     parser.add_argument('--dtypes', nargs = "*",
                         type = str,
                         metavar = list,
                         default = [],
-                        help="datatypes, in 'key=value' format with no spaces. Eg --dtypes year=float64")
+                        help="Datatypes to override, in 'key=value' format with no spaces. Eg --dtypes year=float32")
 
     parser.add_argument('--log-level',
         type = int,
@@ -63,7 +63,10 @@ def parse_args(arguments = None):
 
 # This could be overridden by user args.
 
-def refine_schema(schema : pa.Schema) -> Dict[str,pa.Schema]:
+def refine_schema(schema : pa.Schema) -> Dict[str,pa.DataType]:
+    """"
+
+    """
     fields = {}
     seen_ix = False
     for el in schema:
@@ -96,7 +99,7 @@ def determine_schema(args):
                         csv.ReadOptions(block_size= 1024*1024*64),
                         convert_options = csv.ConvertOptions(
                             auto_dict_encode = True,
-                            auto_dict_max_cardinality=4096
+                            auto_dict_max_cardinality=4094
                         ))
     override = {}
     for arg in args.dtypes:
@@ -121,7 +124,7 @@ def determine_schema(args):
         schema[el.name] = t
         if el.name in override:
             schema[el.name] = getattr(pa, override[el.name])()
-
+    schema['ix'] = pa.int64()
     schema_safe = dict([(k, v if not pa.types.is_dictionary(v) else pa.string()) for k, v in schema.items()])
     return schema, schema_safe
 
@@ -260,6 +263,7 @@ def main(arguments = None, csv_block_size = 1024*1024*128):
         schema = refine_schema(raw_schema)
         elements = {name : type for name, type in schema.items()}
         if not "ix" in elements:
+            # Must always be an ix field.
             elements['ix'] = pa.uint64()
         raw_schema = pa.schema(elements)
 
@@ -268,7 +272,7 @@ def main(arguments = None, csv_block_size = 1024*1024*128):
 
     count_holder = defaultdict(Counter)
 
-    recoders = dict()
+    recoders : Dict = dict()
 
     for field in raw_schema:
         if (pa.types.is_dictionary(field.type)):
@@ -341,6 +345,7 @@ class Tile():
                 d[t] = remap_all_dicts(tab[t], *recoders[t])
             d[t] = tab[t]
         if randomize > 0:
+            # Circular jitter to avoid overplotting.
             rho = nprandom.normal(0, args.randomize, tab.shape[0])
             theta = nprandom.uniform(0, 2 * np.pi, tab.shape[0])
             d['x'] = pc.add(d['x'], pc.multiply(rho, pc.cos(theta)))
@@ -458,6 +463,8 @@ class Tile():
             frame = pa.Table.from_batches(self.data, schema_copy).combine_chunks()
         else:
             raise ValueError(f"Unrecognized data type: {type(self.data)}")
+        if not "ix" in frame.column_names:
+            raise TypeError("Should have ix already.")
         feather.write_feather(frame, destination, compression = compression)
         self.data = None
         return len(frame)

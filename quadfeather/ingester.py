@@ -38,6 +38,9 @@ class ArrowIngester(Ingester):
           yield fin.get_batch(i)
       if self.destructive:
         file.unlink()
+"""
+class CSVIngester(Ingester):
+"""
 
 class FeatherIngester(Ingester):
   def batches(self):
@@ -47,6 +50,7 @@ class FeatherIngester(Ingester):
         yield batch
       if self.destructive:
         fin.unlink()
+  
 class ParquetIngester(Ingester):
   def batches(self):
     for f in self.files:

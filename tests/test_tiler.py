@@ -18,9 +18,13 @@ class TestCSV():
   3,3,3
   4,4,4""")
     main(["--files", str(csv_path), '--destination', str(tmp_path / "tiles")])
-  
+    tb = feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
+    # Should introduce a new 'ix' column.
+    for k in ['ix', 'x', 'y', 'z']:
+      assert k in tb.column_names
+
   def test_failure_with_no_x_field(self, tmp_path):
-    # Create a CSV file with four rows.
+    # Create a CSV= file with four rows.
     with pytest.raises(KeyError):
       csv_path = tmp_path / "test.csv"
       with csv_path.open("w") as fout:
