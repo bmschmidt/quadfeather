@@ -150,6 +150,7 @@ def rewrite_in_arrow_format(files, schema_safe : pa.Schema,
         "y": [float("inf"), -float("inf")],
     }
     output_dir = files[0].parent / "_deepscatter_tmp"
+    shutil.rmtree(output_dir) # in case it exists already from a previous tiling
     output_dir.mkdir()
     if "z" in schema.keys():
         extent["z"] = [float("inf"), -float("inf")]
