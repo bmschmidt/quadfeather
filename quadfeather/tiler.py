@@ -87,6 +87,8 @@ def refine_schema(schema : pa.Schema) -> Dict[str,pa.DataType]:
             fields[el.name] = pa.float32()
         elif pa.types.is_date32(el.type):
             fields[el.name] = pa.date32()
+        elif pa.types.is_temporal(el.type):
+            fields[el.name] = pa.timestamp('ms')
         else:
             raise TypeError(f"Unsupported type {el.type}")
             fields[el.name] = el.type
