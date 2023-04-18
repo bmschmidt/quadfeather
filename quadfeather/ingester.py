@@ -36,6 +36,8 @@ class ArrowIngester(Ingester):
       with pa.ipc.open_file(source, options = pa.ipc.IpcReadOptions(included_fields = self.columns)) as fin:
         for i in range(fin.num_record_batches):
           yield fin.get_batch(i)
+          
+      source.close()
       if self.destructive:
         file.unlink()
 """
