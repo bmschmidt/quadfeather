@@ -345,7 +345,7 @@ class Tile():
         for t in tab.schema.names:
             if t in recoders:
                 d[t] = remap_all_dicts(tab[t], *recoders[t])
-            d[t] = tab[t]
+            d[t] = tab[t].cast(schema.field(t).type, safe = False)
         if randomize > 0:
             # Circular jitter to avoid overplotting.
             rho = nprandom.normal(0, args.randomize, tab.shape[0])
