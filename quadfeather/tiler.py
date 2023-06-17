@@ -14,6 +14,7 @@ import numpy as np
 import sys
 from math import isfinite, sqrt
 from .ingester import get_ingester
+import tempfile
 logger = logging.getLogger("quadfeather")
 
 def parse_args(arguments = None):
@@ -137,7 +138,7 @@ def determine_schema(args):
 # everything from arrow than from CSV.
 
 def rewrite_in_arrow_format(files, schema_safe : pa.Schema, 
-        schema : pa.Schema, csv_block_size : int = 1024*1024*128):
+        schema : pa.Schema, csv_block_size : int = 1024*1024*128, tmpdir = Path("/tmp")):
     # Returns: an extent and a list of feather files.
     # files: a list of csvs
     # schema_safe: the output schema (with no dictionary types)
@@ -149,10 +150,8 @@ def rewrite_in_arrow_format(files, schema_safe : pa.Schema,
         "x": [float("inf"), -float("inf")],
         "y": [float("inf"), -float("inf")],
     }
-    output_dir = files[0].parent / "_deepscatter_tmp"
+    output_dir = tmpdir / "_deepscatter_tmp"
     output_dir.mkdir()
-    if "z" in schema.keys():
-        extent["z"] = [float("inf"), -float("inf")]
 
     rewritten_files : list[Path] = []
     for FIN in files:
@@ -175,10 +174,10 @@ def rewrite_in_arrow_format(files, schema_safe : pa.Schema,
             d["ix"] = pa.array(range(ix, ix + len(batch)), type = pa.uint64())
             ix += len(batch)
             for dim in extent.keys(): # ["x", "y", maybe "z"]
-                col = data.column(dim)
-                zoo = col.to_pandas().agg([min, max])
-                extent[dim][0] = min(extent[dim][0], zoo['min'])
-                extent[dim][1] = max(extent[dim][1], zoo['max'])
+                col = data[dim]
+                minmax = pc.min_max(col)
+                extent[dim][0] = min(extent[dim][0], minmax.get('min').as_py())
+                extent[dim][1] = max(extent[dim][1], minmax.get('max').as_py())
             final_table = pa.table(d)
             fout = output_dir / f"{chunk_num}.feather"
             feather.write_feather(final_table, fout, compression = "zstd")
@@ -211,79 +210,73 @@ def main(arguments = None, csv_block_size = 1024*1024*128):
     csv_block_size: the block size to use when reading the csv files. The default should be fine,
         but included here to allow for testing multiple blocks.
     """
-    args = parse_args(arguments)
-    dirs_to_cleanup = []
-    if (args.files[0].suffix == '.csv' or str(args.files[0]).endswith(".csv.gz")):
-        schema, schema_safe = determine_schema(args)
-        # currently the dictionary type isn't supported while reading CSVs.
-        # So we have to do some monkey business to store it as keys at first, then convert to dictionary later.
-        logger.info(schema)
-        rewritten_files, extent, raw_schema = rewrite_in_arrow_format(args.files, schema_safe, schema, csv_block_size)
-        dirs_to_cleanup.append(rewritten_files[0].parent)
-        logger.info("Done with preliminary build")
-    else:
-        rewritten_files = args.files
-        if not isfinite(args.limits[0]):
-            fin = args.files[0]
-            if fin.suffix == ".feather" or fin.suffix == ".parquet":
-                reader = get_ingester(args.files)
-                xmin = args.limits[0]
-                ymin = args.limits[1]
-                xmax = args.limits[2]
-                ymax = args.limits[3]
-                for batch in reader:
-                    x = pc.min_max(batch['x']).as_py()
-                    y = pc.min_max(batch['y']).as_py()
-                    if x['min'] < xmin and isfinite(x['min']):
-                        xmin = x['min']
-                    if x['max'] > xmax and isfinite(x['max']):
-                        xmax = x['max']
-                    if y['min'] < ymin and isfinite(y['min']):
-                        ymin = y['min']
-                    if y['max'] > ymax and isfinite(y['max']):
-                        ymax = y['max']
-                extent = {
-                    "x": [xmin, xmax],
-                    "y": [ymin, ymax]
-                }
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        tmpdir = Path(tmpdirname)
+        args = parse_args(arguments)
+        logger = logging.getLogger("quadfeather")
+        if (args.files[0].suffix == '.csv' or str(args.files[0]).endswith(".csv.gz")):
+            logger.info("It's a CSV")
+            schema, schema_safe = determine_schema(args)
+            # currently the dictionary type isn't supported while reading CSVs.
+            # So we have to do some monkey business to store it as keys at first, then convert to dictionary later.
+            logger.info(schema)
+            rewritten_files, extent, raw_schema = rewrite_in_arrow_format(args.files, schema_safe, schema, csv_block_size, tmpdir)
+            logger.info("Done with preliminary build")
         else:
-            extent = {
-                "x": [args.limits[0], args.limits[2]],
-                "y": [args.limits[1], args.limits[3]]
-            }
+            rewritten_files = args.files
+            if not isfinite(args.limits[0]):
+                fin = args.files[0]
+                if fin.suffix == ".feather" or fin.suffix == ".parquet":
+                    reader = get_ingester(args.files)
+                    xmin = args.limits[0]
+                    ymin = args.limits[1]
+                    xmax = args.limits[2]
+                    ymax = args.limits[3]
+                    for batch in reader:
+                        x = pc.min_max(batch['x']).as_py()
+                        y = pc.min_max(batch['y']).as_py()
+                        if x['min'] < xmin and isfinite(x['min']):
+                            xmin = x['min']
+                        if x['max'] > xmax and isfinite(x['max']):
+                            xmax = x['max']
+                        if y['min'] < ymin and isfinite(y['min']):
+                            ymin = y['min']
+                        if y['max'] > ymax and isfinite(y['max']):
+                            ymax = y['max']
+                    extent = {
+                        "x": [xmin, xmax],
+                        "y": [ymin, ymax]
+                    }
+            else:
+                extent = {
+                    "x": [args.limits[0], args.limits[2]],
+                    "y": [args.limits[1], args.limits[3]]
+                }
 
-        logger.info("extent")
-        logger.info(extent)
-        if args.files[0].suffix == '.feather':
-            first_batch = ipc.RecordBatchFileReader(args.files[0])
-            raw_schema = first_batch.schema
-        elif args.files[0].suffix == '.parquet':
-            first_batch = pq.ParquetFile(args.files[0])
-            raw_schema = first_batch.schema_arrow
-        schema = refine_schema(raw_schema)
-        elements = {name : type for name, type in schema.items()}
-        if not "ix" in elements:
-            # Must always be an ix field.
-            elements['ix'] = pa.uint64()
-        raw_schema = pa.schema(elements)
+            logger.info("extent")
+            logger.info(extent)
+            if args.files[0].suffix == '.feather':
+                first_batch = ipc.RecordBatchFileReader(args.files[0])
+                raw_schema = first_batch.schema
+            elif args.files[0].suffix == '.parquet':
+                first_batch = pq.ParquetFile(args.files[0])
+                raw_schema = first_batch.schema_arrow
+            schema = refine_schema(raw_schema)
+            elements = {name : type for name, type in schema.items()}
+            if not "ix" in elements:
+                # Must always be an ix field.
+                elements['ix'] = pa.uint64()
+            raw_schema = pa.schema(elements)
 
+        recoders : Dict = dict()
 
-    logging.info("Starting.")
+        for field in raw_schema:
+            if (pa.types.is_dictionary(field.type)):
+                recoders[field.name] = get_recoding_arrays(rewritten_files, field.name)
+        tiler = Tile(extent, [0, 0, 0], args)
+        tiler.insert_files(files = rewritten_files, schema = schema, recoders = recoders)
 
-    count_holder = defaultdict(Counter)
-
-    recoders : Dict = dict()
-
-    for field in raw_schema:
-        if (pa.types.is_dictionary(field.type)):
-            recoders[field.name] = get_recoding_arrays(rewritten_files, field.name)
-
-    count_read = 0
-
-    tiler = Tile(extent, [0, 0, 0], args)
-    tiler.insert_files(files = rewritten_files, schema = schema, recoders = recoders)
-
-    logger.info("Job complete.")
+        logger.info("Job complete.")
     
 
 def partition(table: pa.Table, midpoint: Tuple[str, float]) -> List[pa.Table]:
