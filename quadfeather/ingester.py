@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import DefaultDict, Dict, List, Tuple, Set, Optional
 
 class Ingester:
-  def __init__(self, files : list[Path], batch_size : int = 1024 * 1024 * 1024, columns = None, destructive = False):
+  def __init__(self, files : List[Path], batch_size : int = 1024 * 1024 * 1024, columns = None, destructive = False):
     # Allow iteration over a st
     # queue_size: maximum bytes in an insert chunk.
     self.files = files
