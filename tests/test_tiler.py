@@ -20,7 +20,13 @@ class TestCSV:
   3,3,3
   4,4,4"""
             )
-        main(["--files", str(csv_path), "--destination", str(tmp_path / "tiles")])
+        main(
+            **{
+                "files": [str(csv_path)],
+                "destination": str(tmp_path / "tiles"),
+                "extent": None,
+            }
+        )
         tb = feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
         # Should introduce a new 'ix' column.
         for k in ["ix", "x", "y", "z"]:
@@ -38,52 +44,65 @@ class TestCSV:
           3,3,3
           4,4,4"""
                 )
-            main(["--files", str(csv_path), "--destination", str(tmp_path / "tiles")])
+            main(
+                **{
+                    "files": [str(csv_path)],
+                    "destination": str(tmp_path / "tiles"),
+                    "extent": None,
+                }
+            )
 
     def test_demo_file(self, tmp_path):
         demo_main(tmp_path / "test.csv")
         main(
-            [
-                "--files",
-                str(tmp_path / "test.csv"),
-                "--destination",
-                str(tmp_path / "tiles"),
-            ]
+            **{
+                "files": [str(tmp_path / "test.csv")],
+                "destination": str(tmp_path / "tiles"),
+                "extent": None,
+            }
         )
-
-    def test_demo_date_as_str(self, tmp_path):
-        demo_main(tmp_path / "test.csv")
-        main(
-            [
-                "--files",
-                str(tmp_path / "test.csv"),
-                "--destination",
-                str(tmp_path / "tiles"),
-                "--dtypes",
-                "date=string",
-            ]
-        )
+        tb = feather.read_table(tmp_path / "tiles" / "manifest.feather")
+        assert tb.num_rows > 5
+        assert sum(tb["nPoints"].to_pylist()) == 100_000
 
     def test_demo_date_as_str_small_block(self, tmp_path):
         demo_main(tmp_path / "test.csv", SIZE=100_000)
         main(
-            [
-                "--files",
-                str(tmp_path / "test.csv"),
-                "--destination",
-                str(tmp_path / "tiles"),
-                "--dtypes",
-                "date=string",
-            ],
+            files=[tmp_path / "test.csv"],
+            destination=tmp_path / "tiles",
+            dtypes={"date": pa.string},
             csv_block_size=4096,
         )
         root = str(tmp_path / "tiles")
-        length = int(
-            feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
-            .schema.metadata[b"total_points"]
-            .decode("utf-8")
-        )
+        t = feather.read_table(tmp_path / "tiles" / "manifest.feather")
+        length = pc.sum(t["nPoints"]).as_py()
         assert length == 100_000
+
+    def test_categorical_cast(self, tmp_path):
+        input = tmp_path / "test.csv"
+        with input.open("w") as fout:
+            fout.write(f"x,y,cat\n")
+            # Write 10,000 of each category to see if the later ones throw a dictionary error.
+            rows = []
+            for key, count in [
+                ("apple", 10_000),
+                ("banana", 1_000),
+                ("strawberry", 100),
+                ("mulberry", 10),
+            ]:
+                for _ in range(count):
+                    rows.append(f"{random.random()},{random.random()},{key}\n")
+            random.shuffle(rows)
+            for line in rows:
+                fout.write(line)
+        main(
+            files=[input],
+            destination=tmp_path / "tiles",
+            dictionaries={
+                "cat": pa.array(["apple", "banana", "strawberry", "mulberry"])
+            },
+            csv_block_size=1024,
+        )
 
     def test_if_break_categorical_chunks(self, tmp_path):
         input = tmp_path / "test.csv"
@@ -95,14 +114,11 @@ class TestCSV:
                     fout.write(f"{random.random()},{random.random()},{key}\n")
 
         main(
-            [
-                "--files",
-                str(input),
-                "--destination",
-                str(tmp_path / "tiles"),
-                "--dtypes",
-                "cat=string",
-            ],
+            files=[input],
+            destination=tmp_path / "tiles",
+            dictionaries={
+                "cat": pa.array(["apple", "banana", "strawberry", "mulberry"])
+            },
             csv_block_size=1024,
         )
 
@@ -114,22 +130,14 @@ class TestCSV:
         demo_main(tmp_path / "test.csv", SIZE=1_000_000)
         # This should require over 1,000 blocks.
         main(
-            [
-                "--files",
-                str(tmp_path / "test.csv"),
-                "--destination",
-                str(tmp_path / "tiles"),
-                "--tile_size",
-                "1000",
-            ]
+            files=[tmp_path / "test.csv"],
+            destination=tmp_path / "tiles",
+            tile_size=1000,
+            first_tile_size=100,
         )
-        root = str(tmp_path / "tiles")
-        length = int(
-            feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
-            .schema.metadata[b"total_points"]
-            .decode("utf-8")
-        )
-        assert length == 1_000_000
+        tb = feather.read_table(tmp_path / "tiles" / "manifest.feather")
+        assert sum(tb["nPoints"].to_pylist()) == 1_000_000
+        assert all([row <= 1000 for row in tb["nPoints"].to_pylist()])
 
 
 class TestParquet:
@@ -137,21 +145,13 @@ class TestParquet:
         size = 5_000_000
         demo_parquet(tmp_path / "test.parquet", size=size)
         main(
-            [
-                "--files",
-                str(tmp_path / "test.parquet"),
-                "--destination",
-                str(tmp_path / "tiles"),
-                "--tile_size",
-                "5000",
-            ]
+            files=[tmp_path / "test.parquet"],
+            destination=tmp_path / "tiles",
+            tile_size=5000,
+            first_tile_size=1000,
         )
-        length = int(
-            feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
-            .schema.metadata[b"total_points"]
-            .decode("utf-8")
-        )
-        assert length == size
+        manifest = feather.read_table(tmp_path / "tiles" / "manifest.feather")
+        assert pc.sum(manifest["nPoints"]).as_py() == size
         tb = feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
         ps = tb["ix"].to_pylist()
         assert ps[0] == 0
@@ -167,7 +167,7 @@ class TestStreaming:
         )
         root_tile = Tile(
             extent=((0, 100), (0, 100)),
-            writer_budget=32,
+            permitted_children=32,
             basedir=tmp_path / "tiles",
             tile_size=1_000,
             first_tile_size=100,

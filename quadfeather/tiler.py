@@ -58,10 +58,27 @@ class TileManifest:
     extent: Rectangle
 
     def to_dict(self):
-        d = self.__dict__
+        d = {**self.__dict__}
         d["children"] = [child.to_dict() for child in self.children]
         d["extent"] = {"x": list(self.extent.x), "y": list(self.extent.y)}
         return d
+
+
+def flatten_manifest(mani: TileManifest) -> List[Dict]:
+    # Flatten a manifest into a table.
+    # This is a recursive function.
+    d = [
+        {
+            "key": mani.key,
+            "nPoints": mani.nPoints,
+            "min_ix": mani.min_ix,
+            "max_ix": mani.max_ix,
+            "extent": json.dumps(mani.to_dict()["extent"]),
+        }
+    ]
+    for child in mani.children:
+        d += flatten_manifest(child)
+    return d
 
 
 def parse_args():
@@ -165,9 +182,9 @@ def refine_schema(schema: pa.Schema) -> Dict[str, pa.DataType]:
     return fields
 
 
-def determine_schema(args):
+def determine_schema(files: List[Path]):
     vals = csv.open_csv(
-        args["files"][0],
+        files[0],
         csv.ReadOptions(block_size=1024 * 1024 * 64),
         convert_options=csv.ConvertOptions(
             auto_dict_encode=True, auto_dict_max_cardinality=4094
@@ -223,15 +240,15 @@ def rewrite_in_arrow_format(
     # schema: the input schema (with dictionary types)
     # csv_block_size: the block size to use when reading the csv files.
 
-    ix = 0
-    extent = {
-        "x": [float("inf"), -float("inf")],
-        "y": [float("inf"), -float("inf")],
-    }
+    # ix = 0
+    extent = Rectangle(
+        x=(float("inf"), -float("inf")),
+        y=(float("inf"), -float("inf")),
+    )
     output_dir = files[0].parent / "_deepscatter_tmp"
     output_dir.mkdir()
-    if "z" in schema.keys():
-        extent["z"] = [float("inf"), -float("inf")]
+    # if "z" in schema.keys():
+    #     extent["z"] = [float("inf"), -float("inf")]
 
     rewritten_files: list[Path] = []
     for FIN in files:
@@ -253,13 +270,12 @@ def rewrite_in_arrow_format(
             data = pa.Table.from_batches([batch])
             # Count each element in a uint64 array (float32 risks overflow,
             # Uint32 supports up to 2 billion or so, which is cutting it close for stars.)
-            d["ix"] = pa.array(range(ix, ix + len(batch)), type=pa.uint64())
-            ix += len(batch)
-            for dim in extent.keys():  # ["x", "y", maybe "z"]
-                col = data.column(dim)
-                zoo = col.to_pandas().agg([min, max])
-                extent[dim][0] = min(extent[dim][0], zoo["min"])
-                extent[dim][1] = max(extent[dim][1], zoo["max"])
+            # d["ix"] = pa.array(range(ix, ix + len(batch)), type=pa.uint64())
+            # ix += len(batch)
+            xlim = pc.min_max(data["x"]).as_py()
+            ylim = pc.min_max(data["y"]).as_py()
+            extent.x = (min(extent.x[0], xlim["min"]), max(extent.x[1], xlim["max"]))
+            extent.y = (min(extent.y[0], ylim["min"]), max(extent.y[1], ylim["max"]))
             final_table = pa.table(d)
             fout = output_dir / f"{chunk_num}.feather"
             feather.write_feather(final_table, fout, compression="zstd")
@@ -269,9 +285,8 @@ def rewrite_in_arrow_format(
     # Learn the schema from the last file written out.
 
 
-def check_filesnames(args):
-    files = args["files"]
-    ftypes = [f.split(".")[-1] for f in files]
+def check_filesnames(files: List[Path]):
+    ftypes = [f.suffix for f in files]
     for f in ftypes:
         if f != f[0]:
             raise TypeError(
@@ -281,7 +296,17 @@ def check_filesnames(args):
         raise TypeError("Must use files ending in 'feather', 'arrow', or '.csv'")
 
 
-def main(csv_block_size=1024 * 1024 * 128):
+def main(
+    files: Union[List[str], List[Path]],
+    destination: Union[str, Path],
+    extent: Union[None, Rectangle, Dict[str, Tuple[float, float]]] = None,
+    csv_block_size=1024 * 1024 * 128,
+    tile_size=65_000,
+    first_tile_size=2000,
+    dictionaries: Dict[str, pa.Array] = {},
+    # Actually dict of pa type constructors.
+    dtypes: Dict[str, Any] = {},
+):
     """
     Run a tiler
 
@@ -289,28 +314,30 @@ def main(csv_block_size=1024 * 1024 * 128):
     csv_block_size: the block size to use when reading the csv files. The default should be fine,
         but included here to allow for testing multiple blocks.
     """
-    args = parse_args()
+
+    files = [Path(file) for file in files]
+    destination = Path(destination)
+    if extent is not None and isinstance(extent, dict):
+        extent = Rectangle(**extent)
     dirs_to_cleanup = []
-    if args["files"][0].suffix == ".csv" or str(args["files"][0]).endswith(".csv.gz"):
-        schema, schema_safe = determine_schema(args)
+    if files[0].suffix == ".csv" or str(files[0]).endswith(".csv.gz"):
+        schema, schema_safe = determine_schema(files)
         # currently the dictionary type isn't supported while reading CSVs.
         # So we have to do some monkey business to store it as keys at first, then convert to dictionary later.
         logger.info(schema)
         rewritten_files, extent, raw_schema = rewrite_in_arrow_format(
-            args["files"], schema_safe, schema, csv_block_size
+            files, schema_safe, schema, csv_block_size
         )
         dirs_to_cleanup.append(rewritten_files[0].parent)
         logger.info("Done with preliminary build")
     else:
-        rewritten_files = args["files"]
-        if not isfinite(args["limits"][0]):
-            fin = args["files"][0]
+        rewritten_files = files
+        if extent is None:
+            fin = files[0]
             if fin.suffix == ".feather" or fin.suffix == ".parquet":
-                reader = get_ingester(args["files"])
-                xmin = args["limits"][0]
-                ymin = args["limits"][1]
-                xmax = args["limits"][2]
-                ymax = args["limits"][3]
+                reader = get_ingester(files)
+                xmin, xmax = (float("inf"), -float("inf"))
+                ymin, ymax = (float("inf"), -float("inf"))
                 for batch in reader:
                     x = pc.min_max(batch["x"]).as_py()
                     y = pc.min_max(batch["y"]).as_py()
@@ -322,20 +349,13 @@ def main(csv_block_size=1024 * 1024 * 128):
                         ymin = y["min"]
                     if y["max"] > ymax and isfinite(y["max"]):
                         ymax = y["max"]
-                extent = {"x": [xmin, xmax], "y": [ymin, ymax]}
-        else:
-            extent = {
-                "x": [args["limits"][0], args["limits"][2]],
-                "y": [args["limits"][1], args["limits"][3]],
-            }
+                extent = Rectangle(x=(xmin, xmax), y=(ymin, ymax))
 
-        logger.info("extent")
-        logger.info(extent)
-        if args["files"][0].suffix == ".feather":
-            first_batch = ipc.RecordBatchFileReader(args["files"][0])
+        if files[0].suffix == ".feather":
+            first_batch = ipc.RecordBatchFileReader(files[0])
             raw_schema = first_batch.schema
-        elif args["files"][0].suffix == ".parquet":
-            first_batch = pq.ParquetFile(args["files"][0])
+        elif files[0].suffix == ".parquet":
+            first_batch = pq.ParquetFile(files[0])
             raw_schema = first_batch.schema_arrow
         schema = refine_schema(raw_schema)
         elements = {name: type for name, type in schema.items()}
@@ -352,7 +372,17 @@ def main(csv_block_size=1024 * 1024 * 128):
         if pa.types.is_dictionary(field.type):
             recoders[field.name] = get_recoding_arrays(rewritten_files, field.name)
 
-    tiler = Tile(extent, [0, 0, 0], args)
+    if extent is None:
+        raise ValueError("Extent must be defined.")
+    tiler = Tile(
+        extent=extent,
+        basedir=destination,
+        tile_code=(0, 0, 0),
+        first_tile_size=first_tile_size,
+        tile_size=tile_size,
+        dictionaries=dictionaries,
+        dtypes=dtypes,
+    )
     tiler.insert_files(files=rewritten_files, schema=schema, recoders=recoders)
 
     logger.info("Job complete.")
@@ -380,8 +410,11 @@ class Tile:
         tile_code: Tuple[int, int, int] = (0, 0, 0),
         first_tile_size=2000,
         tile_size=65_000,
-        writer_budget=32,
+        permitted_children: Optional[int] = 5,
         randomize=0.0,
+        dictionaries: Dict[str, pa.Array] = {},
+        # Actually dict of pa type constructors.
+        dtypes: Dict[str, Any] = {},
         parent: Optional["Tile"] = None,
     ):
         """
@@ -393,6 +426,8 @@ class Tile:
         self.ix_extent: Tuple[int, int] = (-1, -2)  # Initalize with bad values
         self.coords = tile_code
 
+        self.dictionaries = dictionaries
+        self.dtypes = dtypes
         if isinstance(extent, tuple):
             extent = Rectangle(x=extent[0], y=extent[1])
         self.extent = extent
@@ -401,7 +436,7 @@ class Tile:
         self.first_tile_size = first_tile_size
         self.tile_size = tile_size
         self.schema = None
-        self.writer_budget = writer_budget
+        self.permitted_children = permitted_children
         # Wait to actually create the directories until needed.
         self._filename: Optional[Path] = None
         self._children: Union[List[Tile], None] = None
@@ -410,22 +445,22 @@ class Tile:
         self.parent = parent
         # Running count of inserted points. Used to create counters.
         self.count_inserted = 0
-
         # Unwritten records for that need to be flushed.
         self.data: Optional[List[pa.RecordBatch]] = []
-
-        # Unwritten records for my children.
-        self.hold_for_children = []
 
         self.n_data_points: int = 0
         self.n_flushed = 0
         self.total_points = 0
         self.manifest: Optional[TileManifest] = None
 
+    def overall_tile_budget(self):
+        if self.parent is not None:
+            return self.parent.overall_tile_budget()
+        return self.permitted_children
+
     def insert(
         self,
         tab: Union[pa.Table, pa.RecordBatch],
-        recoders={},
     ):
         if isinstance(tab, pa.RecordBatch):
             tab = pa.Table.from_batches([tab])
@@ -441,17 +476,22 @@ class Tile:
         d = dict()
         # Remap values if necessary.
         for t in tab.schema.names:
-            if t in recoders:
-                d[t] = remap_all_dicts(tab[t], *recoders[t])
-            d[t] = tab[t]
+            if t in self.dictionaries:
+                d[t] = remap_dictionary(tab[t], self.dictionaries[t])
+            elif t in self.dtypes:
+                d[t] = pc.cast(tab[t], self.dtypes[t](), safe=False)
+            else:
+                d[t] = tab[t]
+
         if self.randomize > 0:
-            # Circular jitter to avoid overplotting.
+            # Optional circular jitter to avoid overplotting.
             rho = nprandom.normal(0, self.randomize, tab.shape[0])
             theta = nprandom.uniform(0, 2 * np.pi, tab.shape[0])
             d["x"] = pc.add(d["x"], pc.multiply(rho, pc.cos(theta)))
             d["y"] = pc.add(d["y"], pc.multiply(rho, pc.sin(theta)))
         tab = pa.table(d, schema=self.schema)
-        self.insert_table(tab, tile_budget=self.writer_budget)
+        self.schema = tab.schema
+        self.insert_table(tab)
 
     def finalize(self):
         """
@@ -459,8 +499,12 @@ class Tile:
         """
         logger.debug(f"first flush of {self.coords} complete")
         for tile in self.iterate(direction="top-down"):
+            # First, we close any existing overflow buffers.
             tile.close_overflow_buffers()
+        for tile in self.iterate(direction="top-down"):
             if tile.overflow_loc.exists():
+                # Now we can begin again with the overall budget inserting at this point.
+                tile.permitted_children = self.overall_tile_budget()
                 input = pa.ipc.open_file(tile.overflow_loc)
                 yielder = (input.get_batch(i) for i in range(input.num_record_batches))
                 # Insert in chunks of 100M
@@ -477,6 +521,12 @@ class Tile:
         for tile in self.iterate(direction="bottom-up"):
             manifest = tile.final_flush()
             n_complete += 1
+        if manifest.key == "0/0/0":
+            flattened = flatten_manifest(manifest)
+            tb = pa.Table.from_pylist(flattened)
+            feather.write_feather(
+                tb, self.basedir / "manifest.feather", compression="uncompressed"
+            )
         return manifest  # is now the tile manifest for the root.
 
     def __repr__(self):
@@ -507,7 +557,7 @@ class Tile:
         if self._filename is not None:
             return self._filename
         local_name = Path(*map(str, self.coords)).with_suffix(".feather")
-        dest_file = Path(self.basedir) / local_name
+        dest_file = self.basedir / local_name
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         self._filename = dest_file
         return self._filename
@@ -556,7 +606,7 @@ class Tile:
         self.total_points += self.n_data_points
         self.manifest = TileManifest(
             key=self.id,
-            nPoints=self.total_points,
+            nPoints=self.n_data_points,
             children=children,
             min_ix=min_ix,
             max_ix=max_ix,
@@ -576,7 +626,39 @@ class Tile:
         schema_copy = pa.schema(self.data[0].schema)
         frame = pa.Table.from_batches(self.data, schema_copy).combine_chunks()
         feather.write_feather(frame, destination, compression=compression)
+        minmax = pc.min_max(frame["ix"]).as_py()
+        self.min_ix = minmax["min"]
+        self.max_ix = minmax["max"]
         self.data = None
+
+    def insert_files(
+        self,
+        files,
+        recoders={},
+        schema: Optional[pa.Schema] = None,
+        destructively=False,
+        finalize: bool = True,
+    ):
+        """
+        given a list of files, insert them into the tree at this point.
+        """
+        ingester = get_ingester(files, destructive=destructively)
+        if schema is None:
+            schema = self.schema
+        elif type(schema) == dict:
+            schema = pa.schema(schema)
+        logger.debug(f"starting insertion at {self.coords}")
+        self.insert_ingester(ingester, schema, recoders, finalize=finalize)
+
+    def insert_ingester(
+        self, ingester, schema=None, recoders={}, finalize: bool = False
+    ):
+
+        for tab in ingester:
+            self.insert(tab)
+        logger.debug(f"starting flush from {self.coords}")
+        if finalize:
+            self.finalize()
 
     @property
     def overflow_loc(self):
@@ -612,14 +694,28 @@ class Tile:
     def children(self):
         if self._children is not None:
             return self._children
-        return self.make_children()
+        raise ValueError("Children have not been created.")
 
-    def make_children(self):
+    def make_children(self, weights: List[float]):
         # QUAD ONLY
+        # Weights: a set of weights for how many children to create the
+        # next level with.
 
         # Calling this forces child creation even when it's not wise.
         self._children = []
         midpoints = self.midpoints()
+
+        # This tile has a budget. Four of those are spent on its children;
+        # its largest children may also be allowed to procreate.
+        permitted_grandchildren = self.permitted_children - 4
+
+        child_permission = np.array([0, 0, 0, 0], np.int16)
+
+        while permitted_grandchildren >= 4:
+            biggest_child = np.argmax(weights)
+            child_permission[biggest_child] += 4
+            permitted_grandchildren -= 4
+            weights[biggest_child] /= 4
 
         for i in [0, 1]:
             xlim = [midpoints[0][1], self.extent.x[i]]
@@ -633,8 +729,18 @@ class Tile:
                     self.coords[1] * 2 + i,
                     self.coords[2] * 2 + j,
                 )
+                tilesize = self.TILE_SIZE
+                if coords[0] == 1:
+                    tilesize = int(sqrt(self.first_tile_size * self.tile_size))
                 child = Tile(
-                    extent=extent, basedir=self.basedir, tile_code=coords, parent=self
+                    extent=extent,
+                    basedir=self.basedir,
+                    tile_code=coords,
+                    parent=self,
+                    tile_size=tilesize,
+                    permitted_children=child_permission[i * 2 + j],
+                    dtypes=self.dtypes,
+                    dictionaries=self.dictionaries,
                 )
                 self._children.append(child)
         return self._children
@@ -663,7 +769,7 @@ class Tile:
             logger.error("OWN SCHEMA", self.schema)
             raise TypeError("Attempted to insert a table with a different schema.")
 
-    def insert_table(self, table: pa.Table, tile_budget: int):
+    def insert_table(self, table: pa.Table):
         self.check_schema(table)
         insert_n_locally = self.TILE_SIZE - self.n_data_points
         if insert_n_locally > 0:
@@ -687,38 +793,28 @@ class Tile:
 
         # 4, for quadtrees.
         children_per_tile = 2 ** (len(self.coords) - 1)
+
         # Always use previously created _overflow writer
         if not self._overflow_writer and (
-            tile_budget >= children_per_tile or self._children is not None
+            self.permitted_children >= children_per_tile or self._children is not None
         ):
             # If we can afford to create children, do so.
             total_records = table.shape[0]
             if total_records == 0:
                 return
             partitioning = self.partition_to_children(table)
-            tiles_allowed_overflow = 0
             # The next block creates children and uses up some of the budget:
             # This one accounts for it.
 
+            weights = [float(len(subset)) for subset in partitioning]
+
             if self._children is None:
-                tile_budget -= children_per_tile
-                self.make_children()
+                self.make_children(weights)
+
+            # amount_for_children = self.tile_budget
 
             for child_tile, subset in zip(self.children, partitioning):
-                # Each child gets a number of children proportional to its data share.
-                # This works well on highly clumpy data.
-                # Rebalance from (say) [3, 3, 3, 3]
-                # to [0, 4, 4, 4] since anything less than four will lead to no kids.
-                tiles_allowed = (
-                    tile_budget * (subset.shape[0] / total_records)
-                    + tiles_allowed_overflow
-                )
-                tiles_allowed_overflow = tiles_allowed % children_per_tile
-
-                child_tile.insert_table(
-                    subset, tile_budget=tiles_allowed - tiles_allowed_overflow
-                )
-            return
+                child_tile.insert_table(subset)
         else:
             for batch in table.to_batches():
                 self.overflow_buffer.write_batch(batch)
@@ -743,41 +839,11 @@ def get_recoding_arrays(files, col_name):
     return new_order, new_order_dict
 
 
-def remap_dictionary(chunk, new_order_dict, new_order):
+def remap_dictionary(chunk, new_order):
     # Switch a dictionary to use a pre-assigned set of keys. returns a new chunked dictionary array.
-    index_map = pa.array(
-        [
-            (
-                new_order_dict[str(k)]
-                if str(k) in new_order_dict
-                else len(new_order_dict) - 1
-            )
-            for k in chunk.dictionary
-        ],
-        pa.uint16(),
-    )
-    if chunk.indices.null_count > 0:
-        try:
-            new_indices = pc.fill_null(
-                pc.take(index_map, chunk.indices), new_order_dict["<NA>"]
-            )
-        except KeyError:
-            new_indices = pc.fill_null(
-                pc.take(index_map, chunk.indices), new_order_dict["<Other>"]
-            )
-    else:
-        new_indices = pc.take(index_map, chunk.indices)
 
+    new_indices = pc.index_in(chunk, new_order)
     return pa.DictionaryArray.from_arrays(new_indices, new_order)
-
-
-def remap_all_dicts(col, new_order, new_order_dict):
-    if isinstance(col, pa.ChunkedArray):
-        return pa.chunked_array(
-            remap_dictionary(chunk, new_order_dict, new_order) for chunk in col.chunks
-        )
-    else:
-        return remap_dictionary(col, new_order_dict, new_order)
 
 
 def rebatch(input: Iterator[pa.RecordBatch], size: float) -> Iterator[pa.Table]:
