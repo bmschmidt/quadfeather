@@ -19,6 +19,7 @@ from typing import (
     Set,
     Optional,
     Any,
+    Literal,
     Union,
     Tuple,
 )
@@ -29,7 +30,7 @@ from .ingester import get_ingester, Ingester
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("quadfeather")
-
+logger.setLevel(logging.DEBUG)
 DEFAULTS: Dict[str, Any] = {
     "first_tile_size": 1000,
     "tile_size": 50000,
@@ -141,7 +142,7 @@ def parse_args():
     parser.add_argument("--log-level", type=int, default=30)
     arguments = sys.argv[1:]
     args = parser.parse_args(arguments)
-    logger.setLevel(args.log_level)
+    # logger.setLevel(args.log_level)
 
     return {**DEFAULTS, **vars(args)}
 
@@ -258,7 +259,7 @@ def rewrite_in_arrow_format(
             convert_options=csv.ConvertOptions(column_types=schema_safe),
         )
         for chunk_num, batch in enumerate(vals):
-            logging.info(f"Batch no {chunk_num}")
+            logger.debug(f"Batch no {chunk_num}")
             # Loop through the whole CSV, writing out 100 MB at a time,
             # and converting each batch to dictionary as we go.
             d = dict()
@@ -305,7 +306,7 @@ def main(
     first_tile_size=2000,
     dictionaries: Dict[str, pa.Array] = {},
     # Actually dict of pa type constructors.
-    dtypes: Dict[str, Any] = {},
+    schema: pa.Schema = pa.schema({}),
 ):
     """
     Run a tiler
@@ -324,7 +325,7 @@ def main(
         schema, schema_safe = determine_schema(files)
         # currently the dictionary type isn't supported while reading CSVs.
         # So we have to do some monkey business to store it as keys at first, then convert to dictionary later.
-        logger.info(schema)
+        logger.debug(schema)
         rewritten_files, extent, raw_schema = rewrite_in_arrow_format(
             files, schema_safe, schema, csv_block_size
         )
@@ -364,7 +365,7 @@ def main(
             elements["ix"] = pa.uint64()
         raw_schema = pa.schema(elements)
 
-    logging.info("Starting.")
+    logger.info("Starting.")
 
     recoders: Dict = dict()
 
@@ -374,16 +375,17 @@ def main(
 
     if extent is None:
         raise ValueError("Extent must be defined.")
-    tiler = Tile(
+
+    tiler = Quadtree(
+        mode="write",
+        schema=pa.schema(schema),
         extent=extent,
         basedir=destination,
-        tile_code=(0, 0, 0),
         first_tile_size=first_tile_size,
         tile_size=tile_size,
         dictionaries=dictionaries,
-        dtypes=dtypes,
     )
-    tiler.insert_files(files=rewritten_files, schema=schema, recoders=recoders)
+    tiler.insert_files(files=rewritten_files)
 
     logger.info("Job complete.")
 
@@ -396,6 +398,53 @@ def partition(table: pa.Table, midpoint: Tuple[str, float]) -> List[pa.Table]:
     return splitted
 
 
+class Quadtree:
+    def __init__(
+        self,
+        basedir: Path,
+        extent: Union[Rectangle, Tuple[Tuple[float, float], Tuple[float, float]]],
+        mode: Union[Literal["write"], Literal["read"]] = "read",
+        dictionaries: Dict[str, pa.Array] = {},
+        schema: pa.Schema = pa.schema({}),
+        first_tile_size=2000,
+        tile_size=65_000,
+        max_open_filehandles=32,
+        sidecars: Dict[str, str] = {},
+    ):
+        """
+
+        * sidecars: a dictionary of sidecar files to add to the tileset. The key is the column that
+            should be written in a sidecar, and the value is the extension for the sidecar file.
+        """
+        logger.debug("Creating quadtree")
+        self.tile_size = tile_size
+        self.first_tile_size = first_tile_size
+        self.basedir = basedir
+        self.dictionaries = dictionaries
+        self.max_open_filehandles = max_open_filehandles
+        self.mode = mode
+        if isinstance(extent, tuple):
+            extent = Rectangle(x=extent[0], y=extent[1])
+        self.schema = schema
+        if self.mode == "write":
+            self.root = Tile(
+                quadtree=self,
+                extent=extent,
+                basedir=basedir,
+                permitted_children=max_open_filehandles - 1,
+                tile_code=(0, 0, 0),
+            )
+
+    def insert(self, tab):
+        self.root.insert(tab)
+
+    def insert_files(self, files):
+        self.root.insert_files(files)
+
+    def finalize(self):
+        return self.root.finalize()
+
+
 class Tile:
     """
     A tile is a node in the quadtree that has an associated record batch.
@@ -405,16 +454,13 @@ class Tile:
 
     def __init__(
         self,
+        quadtree: Quadtree,
         extent: Union[Rectangle, Tuple[Tuple[float, float], Tuple[float, float]]],
         basedir: Path,
         tile_code: Tuple[int, int, int] = (0, 0, 0),
-        first_tile_size=2000,
-        tile_size=65_000,
-        permitted_children: Optional[int] = 5,
+        permitted_children: Optional[int] = 4,
         randomize=0.0,
-        dictionaries: Dict[str, pa.Array] = {},
         # Actually dict of pa type constructors.
-        dtypes: Dict[str, Any] = {},
         parent: Optional["Tile"] = None,
     ):
         """
@@ -425,16 +471,13 @@ class Tile:
         """
         self.ix_extent: Tuple[int, int] = (-1, -2)  # Initalize with bad values
         self.coords = tile_code
-
-        self.dictionaries = dictionaries
-        self.dtypes = dtypes
+        logger.debug(f"{' ' * self.coords[0]} creating {self.coords}")
+        self.quadtree = quadtree
         if isinstance(extent, tuple):
             extent = Rectangle(x=extent[0], y=extent[1])
         self.extent = extent
         self.randomize = randomize
         self.basedir = basedir
-        self.first_tile_size = first_tile_size
-        self.tile_size = tile_size
         self.schema = None
         self.permitted_children = permitted_children
         # Wait to actually create the directories until needed.
@@ -453,10 +496,20 @@ class Tile:
         self.total_points = 0
         self.manifest: Optional[TileManifest] = None
 
+    @property
+    def tile_size(self):
+        if self.coords[0] == 0:
+            return self.quadtree.first_tile_size
+        if self.coords[0] == 1:
+            return int(sqrt(self.quadtree.tile_size * self.quadtree.first_tile_size))
+        return self.quadtree.tile_size
+
+    @property
+    def dictionaries(self):
+        return self.quadtree.dictionaries
+
     def overall_tile_budget(self):
-        if self.parent is not None:
-            return self.parent.overall_tile_budget()
-        return self.permitted_children
+        return self.quadtree.max_open_filehandles
 
     def insert(
         self,
@@ -473,13 +526,15 @@ class Tile:
                 ),
             )
         self.count_inserted += len(tab)
+
+        # A remapped version of the tile.
         d = dict()
         # Remap values if necessary.
         for t in tab.schema.names:
             if t in self.dictionaries:
                 d[t] = remap_dictionary(tab[t], self.dictionaries[t])
-            elif t in self.dtypes:
-                d[t] = pc.cast(tab[t], self.dtypes[t](), safe=False)
+            elif t in self.quadtree.schema.names:
+                d[t] = pc.cast(tab[t], self.quadtree.schema.field(t).type, safe=False)
             else:
                 d[t] = tab[t]
 
@@ -493,10 +548,15 @@ class Tile:
         self.schema = tab.schema
         self.insert_table(tab)
 
+    @property
+    def key(self):
+        return "/".join(map(str, self.coords))
+
     def finalize(self):
         """
         Completes the quadtree so that no more points can be added.
         """
+        # print(f"{' ' * self.coords[0]} finalizing {self.key}")
         logger.debug(f"first flush of {self.coords} complete")
         for tile in self.iterate(direction="top-down"):
             # First, we close any existing overflow buffers.
@@ -512,7 +572,7 @@ class Tile:
                     tile.insert(batch)
                 tile.overflow_loc.unlink()
                 # Manifest isn't used
-                manifest = tile.finalize()
+                tile.finalize()
 
         logger.debug(f"child insertion from {self.coords} complete")
         n_complete = 0
@@ -527,21 +587,12 @@ class Tile:
             feather.write_feather(
                 tb, self.basedir / "manifest.feather", compression="uncompressed"
             )
+        # print(f"{' ' * self.coords[0]} finalized {self.key}")
+
         return manifest  # is now the tile manifest for the root.
 
     def __repr__(self):
         return f"Tile:\nextent: {self.extent}\ncoordinates:{self.coords}"
-
-    @property
-    def TILE_SIZE(self):
-        depth = self.coords[0]
-        if depth == 0:
-            return self.first_tile_size
-        elif depth == 1:
-            # geometric mean of first and second
-            return int(sqrt(self.tile_size * self.first_tile_size))
-        else:
-            return self.tile_size
 
     def midpoints(self) -> List[Tuple[str, float]]:
         midpoints: List[Tuple[str, float]] = []
@@ -616,7 +667,7 @@ class Tile:
 
     def flush_data(self, destination, compression):
         """
-        Flushes the locally stored data to disk
+        Flushes the locally stored data on this tile to disk
 
         Returns the number of points written.
         """
@@ -634,7 +685,6 @@ class Tile:
     def insert_files(
         self,
         files,
-        recoders={},
         schema: Optional[pa.Schema] = None,
         destructively=False,
         finalize: bool = True,
@@ -648,12 +698,9 @@ class Tile:
         elif type(schema) == dict:
             schema = pa.schema(schema)
         logger.debug(f"starting insertion at {self.coords}")
-        self.insert_ingester(ingester, schema, recoders, finalize=finalize)
+        self.insert_ingester(ingester, finalize=finalize)
 
-    def insert_ingester(
-        self, ingester, schema=None, recoders={}, finalize: bool = False
-    ):
-
+    def insert_ingester(self, ingester, finalize: bool = False):
         for tab in ingester:
             self.insert(tab)
         logger.debug(f"starting flush from {self.coords}")
@@ -697,6 +744,9 @@ class Tile:
         raise ValueError("Children have not been created.")
 
     def make_children(self, weights: List[float]):
+        logger.warning(
+            f"{' ' * self.coords[0]} Making children with budget of {self.permitted_children} for {self.key}, weights of {weights}"
+        )
         # QUAD ONLY
         # Weights: a set of weights for how many children to create the
         # next level with.
@@ -729,18 +779,13 @@ class Tile:
                     self.coords[1] * 2 + i,
                     self.coords[2] * 2 + j,
                 )
-                tilesize = self.TILE_SIZE
-                if coords[0] == 1:
-                    tilesize = int(sqrt(self.first_tile_size * self.tile_size))
                 child = Tile(
+                    quadtree=self.quadtree,
                     extent=extent,
                     basedir=self.basedir,
                     tile_code=coords,
                     parent=self,
-                    tile_size=tilesize,
                     permitted_children=child_permission[i * 2 + j],
-                    dtypes=self.dtypes,
-                    dictionaries=self.dictionaries,
                 )
                 self._children.append(child)
         return self._children
@@ -771,7 +816,7 @@ class Tile:
 
     def insert_table(self, table: pa.Table):
         self.check_schema(table)
-        insert_n_locally = self.TILE_SIZE - self.n_data_points
+        insert_n_locally = self.tile_size - self.n_data_points
         if insert_n_locally > 0:
             if self.data is None:
                 raise ValueError("Data was already flushed, failing")
@@ -785,7 +830,7 @@ class Tile:
             # All *unwritten* rows are now mapped into the main table to
             # flow into the children.
             table = table.filter(pc.invert(local_mask))
-            if self.n_data_points == self.TILE_SIZE:
+            if self.n_data_points == self.tile_size:
                 # We've just completed. Flush.
                 self.flush_data(self.filename, "uncompressed")
         else:

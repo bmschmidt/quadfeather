@@ -8,6 +8,10 @@ import math
 from pyarrow import parquet as pq, feather
 
 
+def read_first_tile(q: Quadtree):
+    return feather.read_table(q.basedir / "0/0/0.feather")
+
+
 class TestCSV:
     def test_basic(self, tmp_path):
         # Create a CSV file with four rows.
@@ -62,7 +66,7 @@ class TestCSV:
             }
         )
         tb = feather.read_table(tmp_path / "tiles" / "manifest.feather")
-        assert tb.num_rows > 5
+        assert tb.num_rows > 4
         assert sum(tb["nPoints"].to_pylist()) == 100_000
 
     def test_demo_date_as_str_small_block(self, tmp_path):
@@ -70,7 +74,7 @@ class TestCSV:
         main(
             files=[tmp_path / "test.csv"],
             destination=tmp_path / "tiles",
-            dtypes={"date": pa.string},
+            schema=pa.schema({"date": pa.string()}),
             csv_block_size=4096,
         )
         root = str(tmp_path / "tiles")
@@ -81,7 +85,7 @@ class TestCSV:
     def test_categorical_cast(self, tmp_path):
         input = tmp_path / "test.csv"
         with input.open("w") as fout:
-            fout.write(f"x,y,cat\n")
+            fout.write(f"x,y,number,cat\n")
             # Write 10,000 of each category to see if the later ones throw a dictionary error.
             rows = []
             for key, count in [
@@ -91,13 +95,16 @@ class TestCSV:
                 ("mulberry", 10),
             ]:
                 for _ in range(count):
-                    rows.append(f"{random.random()},{random.random()},{key}\n")
+                    rows.append(
+                        f"{random.random()},{random.random()},{random.randint(0, 100)},{key}\n"
+                    )
             random.shuffle(rows)
             for line in rows:
                 fout.write(line)
         main(
             files=[input],
             destination=tmp_path / "tiles",
+            schema=pa.schema({"number": pa.int32()}),
             dictionaries={
                 "cat": pa.array(["apple", "banana", "strawberry", "mulberry"])
             },
@@ -165,17 +172,23 @@ class TestStreaming:
         demo_parquet(
             tmp_path / "t.parquet", size=size, extent=Rectangle(x=(0, 100), y=(0, 100))
         )
-        root_tile = Tile(
+        root_tile = Quadtree(
+            mode="write",
             extent=((0, 100), (0, 100)),
-            permitted_children=32,
+            max_open_filehandles=32,
             basedir=tmp_path / "tiles",
-            tile_size=1_000,
-            first_tile_size=100,
+            tile_size=9_000,
+            first_tile_size=1000,
         )
 
         for batch in pq.ParquetFile(tmp_path / "t.parquet").iter_batches(10_000):
             root_tile.insert(batch)
+
         manifest = root_tile.finalize()
 
-        with open("manifest.json", "w") as fout:
-            json.dump(manifest.to_dict(), fout)
+
+if __name__ == "__main__":
+    logger = logging.getLogger("quadfeather")
+    logger.setLevel(level=logging.DEBUG)
+    t = TestStreaming()
+    t.test_streaming_batches(tmp_path=Path("tmp"))

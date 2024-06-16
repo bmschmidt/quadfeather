@@ -6,6 +6,7 @@ import pyarrow as pa
 import sys
 from pyarrow import parquet as pq
 from quadfeather.tiler import Rectangle
+from pyarrow import compute as pc
 
 dates = []
 
@@ -18,24 +19,27 @@ for y in range(1900, 2020):
             dates.append(f"{y}-{m:02d}-{d:02d}")
 
 
-def rbatch(SIZE, extent: Rectangle = Rectangle(x=(-100, 100), y=(-100, 100))):
+def rbatch(SIZE, extent: Rectangle = Rectangle(x=(0, 100), y=(0, 100))):
     SIZE = int(SIZE)
     frames = []
     classes = ["Banana", "Strawberry", "Apple", "Mulberry"]
     for c in classes:
-        mid_x = np.random.normal() * 10
-        scale = random.random()
-        x = random.normal(loc=mid_x, scale=(scale + 0.5) / 3, size=SIZE // 4)
-        mid_y = np.random.normal() * 10
-        scale = random.random()
-        y = random.normal(loc=mid_y, scale=(scale + 0.5) / 3, size=SIZE // 4)
+        x = random.lognormal(3.5, 0.4, size=SIZE // 4) * 1.5
+        while len(x) < SIZE // 4:
+            x = np.concatenate([x, random.lognormal(3.5, 0.4, size=SIZE // 4) * 1.5])
+        x = x[: SIZE // 4]
+        y = random.lognormal(3.5, 0.4, size=SIZE // 4) * 1.5
+        while len(y) < SIZE // 4:
+            y = np.concatenate([y, random.lognormal(3.5, 0.4, size=SIZE // 4) * 1.5])
+        y = y[: SIZE // 4]
+
         date = random.choice(dates, size=len(x), replace=True)
         frame = pa.table(
             {
-                "x": np.clip(x, extent.x[0], extent.x[1]),
-                "y": np.clip(y, extent.y[0], extent.y[1]),
+                "x": x,
+                "y": y,
                 "class": [c] * len(x),
-                "quantity": random.random(SIZE // 4),
+                "quantity": random.random(len(x)),
                 "date": date,
             }
         )
