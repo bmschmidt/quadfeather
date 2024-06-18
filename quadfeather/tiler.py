@@ -3,7 +3,6 @@ from pyarrow import csv, feather, parquet as pq, compute as pc, ipc as ipc
 
 # import pandas as pd
 import logging
-import shutil
 from pathlib import Path
 import sys
 import argparse
@@ -26,8 +25,10 @@ from typing import (
 import numpy as np
 import sys
 from math import isfinite, sqrt
-from .ingester import get_ingester, Ingester
+from .ingester import get_ingester
 from dataclasses import dataclass, field
+
+import tempfile
 
 logger = logging.getLogger("quadfeather")
 logger.setLevel(logging.DEBUG)
@@ -407,7 +408,7 @@ class Quadtree:
         self,
         basedir: Path,
         extent: Union[Rectangle, Tuple[Tuple[float, float], Tuple[float, float]]],
-        mode: Union[Literal["write"], Literal["read"]] = "read",
+        mode: Union[Literal["write"], Literal["read"], Literal["append"]] = "read",
         dictionaries: Dict[str, pa.Array] = {},
         schema: pa.Schema = pa.schema({}),
         first_tile_size=2000,
@@ -426,6 +427,8 @@ class Quadtree:
         self.dictionaries = dictionaries
         self.max_open_filehandles = max_open_filehandles
         self.mode = mode
+        if mode != "write":
+            raise NotImplementedError("Only write mode is supported right now.")
         self.sidecars = sidecars
         self._insert_schema = None
 
@@ -1028,41 +1031,3 @@ def rebatch(input: Iterator[pa.RecordBatch], size: float) -> Iterator[pa.Table]:
 if __name__ == "__main__":
     args = parse_args()
     main(**args)
-
-    # def from_arrow_generator(
-    #     self,
-    #     ingester: Ingester,
-    #     recoders={},
-    #     schema=None,
-    #     destructively=False,
-    # ):
-    #     pass
-
-    # def insert_files(
-    #     self,
-    #     files,
-    #     recoders={},
-    #     schema: Optional[pa.Schema] = None,
-    #     destructively=False,
-    #     finalize: bool = False,
-    # ):
-    #     """
-    #     given a list of files, insert them into the tree at this point.
-    #     """
-    #     ingester = get_ingester(files, destructive=destructively)
-    #     if schema is None:
-    #         schema = self.schema
-    #     elif type(schema) == dict:
-    #         schema = pa.schema(schema)
-    #     logger.debug(f"starting insertion at {self.coords}")
-    #     self.insert_ingester(ingester, schema, recoders, finalize=finalize)
-
-    # def insert_ingester(
-    #     self, ingester, schema=None, recoders={}, finalize: bool = False
-    # ):
-
-    #     for tab in ingester:
-    #         self.insert(tab, recoders, finalize=finalize)
-    #     logger.debug(f"starting flush from {self.coords}")
-    #     if finalize:
-    #         self.finalize()

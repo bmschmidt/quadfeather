@@ -66,6 +66,7 @@ class ArrowIngester(Ingester):
             ) as fin:
                 for i in range(fin.num_record_batches):
                     yield fin.get_batch(i)
+            source.close()
             if self.destructive:
                 file.unlink()
 
@@ -87,12 +88,12 @@ class FeatherIngester(Ingester):
 
 class ParquetIngester(Ingester):
     def batches(self):
-        for f in self.files:
-            f = pq.ParquetFile(f)
+        for fname in self.files:
+            f = pq.ParquetFile(fname)
             for batch in f.iter_batches(columns=self.columns):
                 yield batch
             if self.destructive:
-                f.unlink()
+                fname.unlink()
 
 
 def get_ingester(
