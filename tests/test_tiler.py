@@ -108,6 +108,7 @@ class TestCSV:
             dictionaries={
                 "cat": pa.array(["apple", "banana", "strawberry", "mulberry"])
             },
+            sidecars={"cat": "cat"},
             csv_block_size=1024,
         )
 
@@ -120,14 +121,23 @@ class TestCSV:
                 for i in range(10000):
                     fout.write(f"{random.random()},{random.random()},{key}\n")
 
-        main(
+        qtree = main(
             files=[input],
             destination=tmp_path / "tiles",
             dictionaries={
                 "cat": pa.array(["apple", "banana", "strawberry", "mulberry"])
             },
+            sidecars={"cat": "cat"},
+            first_tile_size=1000,
             csv_block_size=1024,
         )
+        t1 = qtree.read_root_table("")
+        assert t1.num_rows == 1000
+        assert "cat" not in t1.column_names
+        t2 = qtree.read_root_table("cat")
+        assert t2.num_rows == 1000
+        assert "cat" in t2.column_names
+        assert pa.types.is_dictionary(t2.schema.field_by_name("cat").type)
 
     def test_small_block_overflow(self, tmp_path):
         """
@@ -136,15 +146,21 @@ class TestCSV:
         """
         demo_main(tmp_path / "test.csv", SIZE=1_000_000)
         # This should require over 1,000 blocks.
-        main(
+        qtree = main(
             files=[tmp_path / "test.csv"],
             destination=tmp_path / "tiles",
             tile_size=1000,
             first_tile_size=100,
+            sidecars={"ix": "ix"},
         )
         tb = feather.read_table(tmp_path / "tiles" / "manifest.feather")
         assert sum(tb["nPoints"].to_pylist()) == 1_000_000
         assert all([row <= 1000 for row in tb["nPoints"].to_pylist()])
+        tb1 = qtree.read_root_table("")
+        assert tb1.num_rows == 100
+
+        tb2 = qtree.read_root_table("ix")
+        assert "ix" in tb2.column_names
 
 
 class TestParquet:
@@ -172,19 +188,25 @@ class TestStreaming:
         demo_parquet(
             tmp_path / "t.parquet", size=size, extent=Rectangle(x=(0, 100), y=(0, 100))
         )
-        root_tile = Quadtree(
+        qtree = Quadtree(
             mode="write",
             extent=((0, 100), (0, 100)),
-            max_open_filehandles=32,
+            max_open_filehandles=33,
             basedir=tmp_path / "tiles",
             tile_size=9_000,
             first_tile_size=1000,
         )
 
         for batch in pq.ParquetFile(tmp_path / "t.parquet").iter_batches(10_000):
-            root_tile.insert(batch)
+            qtree.insert(batch)
 
-        manifest = root_tile.finalize()
+        qtree.finalize()
+
+        manifest = qtree.manifest_table
+
+        assert pc.sum(manifest["nPoints"]).as_py() == size
+
+        tb = feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
 
 
 if __name__ == "__main__":

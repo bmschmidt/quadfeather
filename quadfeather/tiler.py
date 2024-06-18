@@ -198,7 +198,7 @@ def determine_schema(files: List[Path]):
     schema = {}
     for el in raw_schema:
         t = el.type
-        if t == pa.int64() and el.name != "ix":
+        if t == pa.uint64() and el.name != "ix":
             t = pa.float32()
         if t == pa.int32() and el.name != "ix":
             t = pa.float32()
@@ -211,7 +211,7 @@ def determine_schema(files: List[Path]):
         schema[el.name] = t
         if el.name in override:
             schema[el.name] = getattr(pa, override[el.name])()
-    schema["ix"] = pa.int64()
+    schema["ix"] = pa.uint64()
     schema_safe = dict(
         [
             (k, v if not pa.types.is_dictionary(v) else pa.string())
@@ -259,7 +259,6 @@ def rewrite_in_arrow_format(
             convert_options=csv.ConvertOptions(column_types=schema_safe),
         )
         for chunk_num, batch in enumerate(vals):
-            logger.debug(f"Batch no {chunk_num}")
             # Loop through the whole CSV, writing out 100 MB at a time,
             # and converting each batch to dictionary as we go.
             d = dict()
@@ -305,8 +304,10 @@ def main(
     tile_size=65_000,
     first_tile_size=2000,
     dictionaries: Dict[str, pa.Array] = {},
+    sidecars: Dict[str, str] = {},
     # Actually dict of pa type constructors.
     schema: pa.Schema = pa.schema({}),
+    max_open_filehandles=33,
 ):
     """
     Run a tiler
@@ -383,11 +384,14 @@ def main(
         basedir=destination,
         first_tile_size=first_tile_size,
         tile_size=tile_size,
+        sidecars=sidecars,
+        max_open_filehandles=max_open_filehandles,
         dictionaries=dictionaries,
     )
     tiler.insert_files(files=rewritten_files)
 
     logger.info("Job complete.")
+    return tiler
 
 
 def partition(table: pa.Table, midpoint: Tuple[str, float]) -> List[pa.Table]:
@@ -412,7 +416,6 @@ class Quadtree:
         sidecars: Dict[str, str] = {},
     ):
         """
-
         * sidecars: a dictionary of sidecar files to add to the tileset. The key is the column that
             should be written in a sidecar, and the value is the extension for the sidecar file.
         """
@@ -423,9 +426,13 @@ class Quadtree:
         self.dictionaries = dictionaries
         self.max_open_filehandles = max_open_filehandles
         self.mode = mode
+        self.sidecars = sidecars
+        self._insert_schema = None
+
         if isinstance(extent, tuple):
             extent = Rectangle(x=extent[0], y=extent[1])
         self.schema = schema
+        self._schemas: Optional[Dict[str, pa.Schema]] = None
         if self.mode == "write":
             self.root = Tile(
                 quadtree=self,
@@ -435,14 +442,79 @@ class Quadtree:
                 tile_code=(0, 0, 0),
             )
 
+    @property
+    def schemas(self) -> Dict[str, pa.Schema]:
+        if self._schemas is not None:
+            return self._schemas
+        fields = defaultdict(list)
+        assert self._insert_schema is not None
+        for field in self._insert_schema:
+            car = self.sidecars.get(field.name, "")
+            dtype = field.type
+            if field.name in self.schema.names:
+                # Check if the user requested a cast
+                dtype = self.schema.field(field.name).type
+            if field in self.dictionaries:
+                # dictionaries are written later.
+                dtype = pa.dictionary(pa.int16(), pa.utf8())
+            fields[car].append(pa.field(field.name, dtype))
+
+        fields[self.sidecars.get("ix", "")].append(pa.field("ix", pa.uint64()))
+        self._schemas = {k: pa.schema(v) for k, v in fields.items()}
+        return self._schemas
+
     def insert(self, tab):
+        """
+        Insert's a table.
+        """
+        if self._insert_schema is None:
+            self._insert_schema = tab.schema
         self.root.insert(tab)
 
-    def insert_files(self, files):
-        self.root.insert_files(files)
+    def insert_files(self, files, finalize=True):
+        ingester = get_ingester(files)
+        for tab in ingester:
+            self.insert(tab)
+        if finalize:
+            self.finalize()
+
+    def final_schema(self):
+        """
+        Returns the schema for all of the items in the quadtree, including written
+        sidecars.
+        """
+        fields = [*self.read_root_table().schema]
+        for sidecarname in set(self.sidecars.values()):
+            sidecar = self.read_root_table(sidecarname).schema
+            fields = [*fields, *sidecar]
+        return pa.schema(fields)
+
+    def read_root_table(self, suffix: str = ""):
+        path = self.basedir / "0/0/0"
+        if suffix != "":
+            path = path.with_suffix(f".{suffix}.feather")
+        else:
+            path = path.with_suffix(".feather")
+
+        return feather.read_table(path)
 
     def finalize(self):
-        return self.root.finalize()
+        manifest = self.root.finalize()
+        flattened = flatten_manifest(manifest)
+        tb = pa.Table.from_pylist(flattened).replace_schema_metadata(
+            {
+                "sidecars": json.dumps(self.sidecars),
+                # The complete schema includes
+                "schema": self.final_schema().serialize().to_pybytes(),
+            }
+        )
+        feather.write_feather(
+            tb, self.basedir / "manifest.feather", compression="uncompressed"
+        )
+
+    @property
+    def manifest_table(self):
+        return feather.read_table(self.basedir / "manifest.feather")
 
 
 class Tile:
@@ -483,8 +555,8 @@ class Tile:
         # Wait to actually create the directories until needed.
         self._filename: Optional[Path] = None
         self._children: Union[List[Tile], None] = None
-        self._overflow_writer = None
-        self._sink = None
+        self._overflow_writers = None
+        self._sinks = None
         self.parent = parent
         # Running count of inserted points. Used to create counters.
         self.count_inserted = 0
@@ -503,6 +575,10 @@ class Tile:
         if self.coords[0] == 1:
             return int(sqrt(self.quadtree.tile_size * self.quadtree.first_tile_size))
         return self.quadtree.tile_size
+
+    @property
+    def sidecar_names(self):
+        return set(self.quadtree.sidecars.values())
 
     @property
     def dictionaries(self):
@@ -565,10 +641,26 @@ class Tile:
             if tile.overflow_loc.exists():
                 # Now we can begin again with the overall budget inserting at this point.
                 tile.permitted_children = self.overall_tile_budget()
-                input = pa.ipc.open_file(tile.overflow_loc)
-                yielder = (input.get_batch(i) for i in range(input.num_record_batches))
+                tables = [
+                    tile.overflow_loc,
+                    *[
+                        tile.overflow_loc.with_suffix(f".{k}.arrow")
+                        for k in self.sidecar_names
+                    ],
+                ]
+                inputs = [pa.ipc.open_file(tb) for tb in tables]
+
+                def yielder() -> Iterator[pa.RecordBatch]:
+                    for i in range(inputs[0].num_record_batches):
+                        root = pa.Table.from_batches([inputs[0].get_batch(i)])
+                        for sidecar in inputs[1:]:
+                            batch = sidecar.get_batch(i)
+                            for col in batch.column_names:
+                                root = root.append_column(col, batch[col])
+                        yield root.combine_chunks().to_batches()[0]
+
                 # Insert in chunks of 100M
-                for batch in rebatch(yielder, 100e6):
+                for batch in rebatch(yielder(), 100e6):
                     tile.insert(batch)
                 tile.overflow_loc.unlink()
                 # Manifest isn't used
@@ -581,12 +673,6 @@ class Tile:
         for tile in self.iterate(direction="bottom-up"):
             manifest = tile.final_flush()
             n_complete += 1
-        if manifest.key == "0/0/0":
-            flattened = flatten_manifest(manifest)
-            tb = pa.Table.from_pylist(flattened)
-            feather.write_feather(
-                tb, self.basedir / "manifest.feather", compression="uncompressed"
-            )
         # print(f"{' ' * self.coords[0]} finalized {self.key}")
 
         return manifest  # is now the tile manifest for the root.
@@ -623,10 +709,12 @@ class Tile:
     def close_overflow_buffers(self):
         self.first_flush()
         # Both will be the case together, checking them for type checks.
-        if self._overflow_writer is not None and self._sink is not None:
-            self._overflow_writer.close()
-            self._sink.close()
-            self._overflow_writer = None
+        if self._overflow_writers is not None and self._sinks is not None:
+            for k, writer in self._overflow_writers.items():
+                writer.close()
+                self._sinks[k].close()
+            self._overflow_writers = None
+            self._sinks = None
 
     def final_flush(self) -> TileManifest:
         """
@@ -676,8 +764,17 @@ class Tile:
 
         schema_copy = pa.schema(self.data[0].schema)
         frame = pa.Table.from_batches(self.data, schema_copy).combine_chunks()
-        feather.write_feather(frame, destination, compression=compression)
+        other_tbs = defaultdict(dict)
         minmax = pc.min_max(frame["ix"]).as_py()
+
+        for k, v in self.quadtree.sidecars.items():
+            other_tbs[v][k] = frame[k]
+            frame = frame.drop(k)
+        feather.write_feather(frame, destination, compression=compression)
+        for k, v in other_tbs.items():
+            feather.write_feather(
+                pa.table(v), destination.with_suffix(f".{k}.feather"), compression
+            )
         self.min_ix = minmax["min"]
         self.max_ix = minmax["max"]
         self.data = None
@@ -712,19 +809,28 @@ class Tile:
         return self.filename.with_suffix(".overflow.arrow")
 
     @property
-    def overflow_buffer(self):
+    def overflow_buffers(self):
         """
         Creates or returns an arbitrary-length file.
         """
 
-        if self._overflow_writer:
-            return self._overflow_writer
+        if self._overflow_writers:
+            return self._overflow_writers
         logger.debug(f"Opening overflow on {self.coords}")
         if self.overflow_loc.exists():
             raise FileExistsError(f"Overflow file already exists: {self.overflow_loc}")
-        self._sink = pa.OSFile(str(self.overflow_loc), "wb")
-        self._overflow_writer = pa.ipc.new_file(self._sink, self.schema)
-        return self._overflow_writer
+        self._overflow_writers = {}
+        self._sinks = {}
+        for k in set(["", *self.quadtree.sidecars.values()]):
+            assert self.quadtree.schemas[k] is not None
+            p = self.overflow_loc
+            if k != "":
+                p = p.with_suffix(f".{k}.arrow")
+            self._sinks[k] = pa.OSFile(str(p), "wb")
+            self._overflow_writers[k] = pa.ipc.new_file(
+                self._sinks[k], self.quadtree.schemas[k]
+            )
+        return self._overflow_writers
 
     def partition_to_children(self, table) -> List[pa.Table]:
         # Coerce to a list in quadtree/octree order.
@@ -840,7 +946,7 @@ class Tile:
         children_per_tile = 2 ** (len(self.coords) - 1)
 
         # Always use previously created _overflow writer
-        if not self._overflow_writer and (
+        if not self._overflow_writers and (
             self.permitted_children >= children_per_tile or self._children is not None
         ):
             # If we can afford to create children, do so.
@@ -850,19 +956,28 @@ class Tile:
             partitioning = self.partition_to_children(table)
             # The next block creates children and uses up some of the budget:
             # This one accounts for it.
-
-            weights = [float(len(subset)) for subset in partitioning]
-
             if self._children is None:
+                weights = [float(len(subset)) for subset in partitioning]
                 self.make_children(weights)
-
-            # amount_for_children = self.tile_budget
-
             for child_tile, subset in zip(self.children, partitioning):
                 child_tile.insert_table(subset)
         else:
-            for batch in table.to_batches():
-                self.overflow_buffer.write_batch(batch)
+            for sidecar, tb in self.keyed_batches(table).items():
+                for batch in tb.to_batches():
+                    try:
+                        self.overflow_buffers[sidecar].write_batch(batch)
+                    except:
+                        pass
+                        raise
+
+    def keyed_batches(self, table: pa.Table):
+        """
+        Divides a table in the separate-sidecar tables to which it
+        will be written.
+        """
+        cars = ["", *self.quadtree.sidecars.values()]
+        schemas = self.quadtree.schemas
+        return {k: table.select(schemas[k].names) for k in cars}
 
 
 def get_better_codes(col, counter=Counter()):
