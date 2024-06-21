@@ -3,8 +3,6 @@ import pytest
 from quadfeather.tiler import *
 from quadfeather.demo import main as demo_main, demo_parquet
 import random
-import json
-import math
 from pyarrow import parquet as pq, feather
 
 
@@ -101,7 +99,7 @@ class TestCSV:
             random.shuffle(rows)
             for line in rows:
                 fout.write(line)
-        main(
+        quadtree = main(
             files=[input],
             destination=tmp_path / "tiles",
             schema=pa.schema({"number": pa.int32()}),
@@ -111,6 +109,13 @@ class TestCSV:
             sidecars={"cat": "cat"},
             csv_block_size=1024,
         )
+
+        batches = []
+        for fin in tmp_path.glob("**/*.cat.feather"):
+            batches.append(feather.read_table(fin))
+
+        alltogether = pa.concat_tables(batches)
+        counts = alltogether["cat"].value_counts().to_pydict()
 
     def test_if_break_categorical_chunks(self, tmp_path):
         input = tmp_path / "test.csv"
@@ -194,6 +199,10 @@ class TestStreaming:
             max_open_filehandles=33,
             basedir=tmp_path / "tiles",
             tile_size=9_000,
+            dictionaries={
+                "cat": pa.array(["apple", "banana", "strawberry", "mulberry"]),
+                "sidecars": {"cat": "cat"},
+            },
             first_tile_size=1000,
         )
 

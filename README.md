@@ -8,6 +8,8 @@ metadata indicating the existence of children.
 
 From the command line (basic):
 
+WORK IN PROGRESS BELOW.
+
 ```bash
 python -m pip install git+https://github.com/bmschmidt/quadfeather
 quadfeather-test-data 255000 # populates a csv at tmp.csv with 255000 items
