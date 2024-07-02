@@ -6,3 +6,4 @@ dist
 manifest.json
 .DS_Store
 tmp
+scratch.ipynb

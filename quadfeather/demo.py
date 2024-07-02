@@ -19,18 +19,38 @@ for y in range(1900, 2020):
             dates.append(f"{y}-{m:02d}-{d:02d}")
 
 
-def rbatch(SIZE, extent: Rectangle = Rectangle(x=(0, 100), y=(0, 100))):
+def rbatch(
+    SIZE,
+    extent: Rectangle = Rectangle(x=(0, 100), y=(0, 100)),
+    method: str = "normal",
+):
     SIZE = int(SIZE)
     frames = []
-    classes = ["Banana", "Strawberry", "Apple", "Mulberry"]
-    for c in classes:
-        x = random.lognormal(3.5, 0.4, size=SIZE // 4) * 1.5
+    if method == "lognormal":
+        f = random.lognormal
+        classes = [
+            ("Banana", [5, 0.01], [5, 0.01]),
+            ("Strawberry", [3.5, 0.4], [3, 0.3]),
+            ("Apple", [4.6, 0.2], [3, 0.2]),
+            ("Mulberry", [5.6, 0.6], [6, 0.5]),
+        ]
+    else:
+        f = random.normal
+        classes = [
+            ("Banana", [0, 0.2], [0, 0.3]),
+            ("Strawberry", [3, 0.05], [-3, 2]),
+            ("Apple", [-4.6, 0.1], [-5, 0.25]),
+            ("Mulberry", [5.6, 2.6], [6, 2.5]),
+        ]
+
+    for c, xparam, yparam in classes:
+        x = f(*xparam, size=SIZE // 4) * 1.5
         while len(x) < SIZE // 4:
-            x = np.concatenate([x, random.lognormal(3.5, 0.4, size=SIZE // 4) * 1.5])
+            x = np.concatenate([x, f(*xparam, size=SIZE // 4)])
         x = x[: SIZE // 4]
-        y = random.lognormal(3.5, 0.4, size=SIZE // 4) * 1.5
+        y = f(*yparam, size=SIZE // 4)
         while len(y) < SIZE // 4:
-            y = np.concatenate([y, random.lognormal(3.5, 0.4, size=SIZE // 4) * 1.5])
+            y = np.concatenate([y, f(*yparam, size=SIZE // 4)])
         y = y[: SIZE // 4]
 
         date = random.choice(dates, size=len(x), replace=True)

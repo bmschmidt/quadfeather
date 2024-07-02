@@ -7,6 +7,8 @@ from pathlib import Path
 import sys
 import argparse
 import json
+import hashlib
+from base64 import urlsafe_b64encode
 from numpy import random as nprandom
 from collections import defaultdict, Counter
 from typing import (
@@ -26,9 +28,7 @@ import numpy as np
 import sys
 from math import isfinite, sqrt
 from .ingester import get_ingester
-from dataclasses import dataclass, field
-
-import tempfile
+from dataclasses import dataclass
 
 logger = logging.getLogger("quadfeather")
 logger.setLevel(logging.DEBUG)
@@ -36,7 +36,7 @@ DEFAULTS: Dict[str, Any] = {
     "first_tile_size": 1000,
     "tile_size": 50000,
     "destination": Path("."),
-    "max_files": 25.0,
+    "max_open_filehandles": 33.0,
     "randomize": 0.0,
     "files": None,
     "limits": [float("inf"), float("inf"), -float("inf"), -float("inf")],
@@ -84,6 +84,7 @@ def flatten_manifest(mani: TileManifest) -> List[Dict]:
 
 
 def parse_args():
+    print("foo")
     parser = argparse.ArgumentParser(
         description="Tile an input file into a large number of arrow files."
     )
@@ -109,9 +110,9 @@ def parse_args():
         help="Destination directory to write to.",
     )
     parser.add_argument(
-        "--max_files",
+        "--max-open-filehandles",
         type=float,
-        default=DEFAULTS["max_files"],
+        default=DEFAULTS["max_open_filehandles"],
         help="Max files to have open at once. Default 25. "
         "Usually it's much faster to have significantly fewer files than the max allowed open by the system ",
     )
@@ -143,7 +144,6 @@ def parse_args():
     parser.add_argument("--log-level", type=int, default=30)
     arguments = sys.argv[1:]
     args = parser.parse_args(arguments)
-    # logger.setLevel(args.log_level)
 
     return {**DEFAULTS, **vars(args)}
 
@@ -309,6 +309,8 @@ def main(
     # Actually dict of pa type constructors.
     schema: pa.Schema = pa.schema({}),
     max_open_filehandles=33,
+    randomize=0,
+    limits=None,
 ):
     """
     Run a tiler
@@ -316,7 +318,11 @@ def main(
     arguments: a list of strings to parse. If None, treat as command line args.
     csv_block_size: the block size to use when reading the csv files. The default should be fine,
         but included here to allow for testing multiple blocks.
+
     """
+
+    if extent is None and limits is not None:
+        extent = Rectangle(x=(limits[0], limits[2]), y=(limits[1], limits[3]))
 
     files = [Path(file) for file in files]
     destination = Path(destination)
@@ -388,6 +394,7 @@ def main(
         sidecars=sidecars,
         max_open_filehandles=max_open_filehandles,
         dictionaries=dictionaries,
+        randomize=randomize,
     )
     tiler.insert_files(files=rewritten_files)
 
@@ -408,13 +415,14 @@ class Quadtree:
         self,
         basedir: Path,
         extent: Union[Rectangle, Tuple[Tuple[float, float], Tuple[float, float]]],
-        mode: Union[Literal["write"], Literal["read"], Literal["append"]] = "read",
+        mode: Literal["read", "write", "append"] = "read",
         dictionaries: Dict[str, pa.Array] = {},
         schema: pa.Schema = pa.schema({}),
         first_tile_size=2000,
         tile_size=65_000,
         max_open_filehandles=32,
         sidecars: Dict[str, str] = {},
+        randomize=0,
     ):
         """
         * sidecars: a dictionary of sidecar files to add to the tileset. The key is the column that
@@ -427,6 +435,7 @@ class Quadtree:
         self.dictionaries = dictionaries
         self.max_open_filehandles = max_open_filehandles
         self.mode = mode
+        self.randomize = randomize
         if mode != "write":
             raise NotImplementedError("Only write mode is supported right now.")
         self.sidecars = sidecars
@@ -440,10 +449,22 @@ class Quadtree:
             self.root = Tile(
                 quadtree=self,
                 extent=extent,
-                basedir=basedir,
                 permitted_children=max_open_filehandles - 1,
                 tile_code=(0, 0, 0),
             )
+        self._tiles = None
+        self._macrotiles: Dict[Tuple[int, int], List[Macrotile]] = {}
+
+    def tiles(self):
+        if self._tiles is not None:
+            return self._tiles
+        self._tiles = [*self.iterate()]
+        return self._tiles
+
+    def macrotiles(self, size: int, parents: int):
+        if (size, parents) in self._macrotiles:
+            return self._macrotiles[(size, parents)]
+        self._macrotiles[(size, parents)] = [*self.iter_macrotiles(size, parents)]
 
     @property
     def schemas(self) -> Dict[str, pa.Schema]:
@@ -519,6 +540,176 @@ class Quadtree:
     def manifest_table(self):
         return feather.read_table(self.basedir / "manifest.feather")
 
+    def build_bloom_index(self, id_field: str, id_sidecar: Optional[str], m=28, k=10):
+        # 24 and 11 are made up defaults here. I chose them
+        # because I was on a plane and gpt4all suggested 20, 7.
+
+        # Make id_field safe for filenames
+        id_field_enc = urlsafe_b64encode(id_field.encode("utf-8"))
+        bloom_filter_loc = (
+            self.basedir / "bloom_filters" / f"{m}-{k}"
+        )
+        each_takes = m / 4
+        assert (
+            32 - each_takes
+        ) > k, f"cannot have more than {(32 - each_takes)} hashes in bloom index"
+
+        for (z, x, y), tiles in self.iter_macrotile_order(2, 1):
+            bloom_filter_loc = bloom_filter_loc / f"{z}/{x}/{y}.{id_field_enc}.feather"
+            bloom_filter_loc.parent.mkdir(parents=True, exist_ok=True)
+            if bloom_filter_loc.exists():
+                continue
+            positions = np.zeros((2**m), np.bool8)
+            tilenames = []
+            for tile in tiles:
+                np.array(
+                    2**m,
+                )
+                col = tile.read_column(id_field, id_sidecar)
+                for item in col:
+                    bytes = item.as_py().encode("utf-8")
+                    hashed = hashlib.md5(bytes).hexdigest()
+                    for i in range(k):
+                        positions[int(hashed[i : i + each_takes], 16)] = True
+                tilenames.append(tile.key)
+
+            tb = pa.table(
+                {
+                    "key": pa.array([f"{z}/{x}/{y}"]),
+                    "children": pa.array([[tilenames]]),
+                    "bitmask": pa.array(positions, pa.list_(pa.bool_(), 2**m)),
+                }
+            )
+            # We write records of a single row at a time. This is wasteful,
+            # but the reason we're using arrow at all for these is to get bitmask-
+            # lists in a sane form, so it's not the end of the world.
+            bloom_filter_loc = bloom_filter_loc / f"{z}/{x}/{y}.{id_field_enc}.feather"
+            bloom_filter_loc.parent.mkdir(parents=True, exist_ok=True)
+            feather.write_feather(tb, bloom_filter_loc, compression = 'zstd')
+
+    def join(
+        self,
+        data: Iterator[pa.Table],
+        key: str,
+        key_sidecar_name: Union[str, None],
+        new_sidecar_name: str,
+    ):
+        """
+        Given an iterator of data with a keyed field 'key' already present,
+        creates matched sidecars.
+        """
+
+    def iterate(
+        self,
+        top_down: bool = True,
+        breadth_firth: bool = True,
+        mode: Literal["read", "append"] = "read",
+    ) -> Iterator["Tile"]:
+        """
+        Iterates through all the tiles in a constructed tree, bottom-up
+        or top-down.
+        """
+        files = self.manifest_table.to_pylist()
+        lookups: Dict[Tuple[int, ...], Rectangle] = {}
+        for f in files:
+            k = tuple(map(int, f["key"].split("/")))
+            assert len(k) == 3
+            r = json.loads(f["extent"])
+            lookups[k] = Rectangle(x=(r["x"][0], r["x"][1]), y=(r["y"][0], r["y"][1]))
+        to_check: List[Tuple[int, int, int]] = [(0, 0, 0)]
+        ordered_list = []
+        while len(to_check) > 0:
+            z, x, y = to_check.pop(0)
+            if (z, x, y) in lookups:
+                ordered_list.append((z, x, y))
+                possible_children = [
+                    (z + 1, x + i, y + j) for i in (0, 1) for j in (0, 1)
+                ]
+                if breadth_firth:
+                    to_check.extend(possible_children)
+                else:
+                    to_check = [*possible_children, *to_check]
+        if not top_down:
+            ordered_list.reverse()
+        for key in ordered_list:
+            yield Tile(self, extent=lookups[key], tile_code=key, mode=mode)
+
+    def iter_macrotile_order(
+        self, size=2, parents=2
+    ) -> Iterator[Tuple[Tuple[int, int, int], List["Tile"]]]:
+        macros = defaultdict(list)
+        for tile in self.iterate(top_down=True):
+            macros[macrotile(tile.coords, size, parents)].append(tile)
+        for coords, tiles in macros.items():
+            yield (coords, tiles)
+
+    def iter_macrotiles(self, size: int, parents: int):
+        for key, tiles in self.iter_macrotile_order(size, parents):
+            t = Macrotile(self, key, size, parents, tiles)
+            yield t
+
+
+class Macrotile:
+    def __init__(
+        self,
+        quadtree: Quadtree,
+        coords: Tuple[int, int, int],
+        size: int,
+        parents: int,
+        tiles: Optional[List["Tile"]] = None,
+    ):
+        assert size % parents == 0
+        self.quadtree = quadtree
+        self.coords = coords
+        self.size = size
+        self.parents = parents
+        self._tiles = tiles
+
+    def children(self) -> List["Macrotile"]:
+        potential_children = []
+        z, x, y = self.coords
+        z += self.parents
+        for i in range(0, 2**self.size):
+            for j in range(0, 2**self.size):
+                potential_children.append(
+                    (z, x * 2**self.size + i, y * 2**self.size + j)
+                )
+        all_tiles = {
+            mt.coords: mt for mt in self.quadtree.macrotiles(self.size, self.parents)
+        }
+
+        children = []
+        for coords in potential_children:
+            if coords in all_tiles:
+                children.append(all_tiles[coords])
+        return children
+
+    def tiles(self) -> Iterator["Tile"]:
+        for tile in self.quadtree.iterate(top_down=True):
+            if macrotile(tile.coords) == self.coords:
+                yield tile
+
+    def insert_join(self, batch, key):
+        pass
+
+    def bloom_filters(self, key):
+
+    def finalize_join_insert(self, key):
+
+    def complete_join(self, key, sidecar_name)
+
+def macrotile(key: Tuple[int, int, int], size=2, parents=2) -> Tuple[int, int, int]:
+
+    assert size % parents == 0
+    z, x, y = key
+    moves = 0
+    while not (moves >= parents and z % size == 0):
+        x = int(x / 2)
+        y = int(y / 2)
+        z = z - 1
+        moves += 1
+    return (z, x, y)
+
 
 class Tile:
     """
@@ -531,12 +722,11 @@ class Tile:
         self,
         quadtree: Quadtree,
         extent: Union[Rectangle, Tuple[Tuple[float, float], Tuple[float, float]]],
-        basedir: Path,
         tile_code: Tuple[int, int, int] = (0, 0, 0),
         permitted_children: Optional[int] = 4,
-        randomize=0.0,
         # Actually dict of pa type constructors.
         parent: Optional["Tile"] = None,
+        mode: Literal["read", "write", "append"] = "read",
     ):
         """
         Create a tile.
@@ -551,8 +741,6 @@ class Tile:
         if isinstance(extent, tuple):
             extent = Rectangle(x=extent[0], y=extent[1])
         self.extent = extent
-        self.randomize = randomize
-        self.basedir = basedir
         self.schema = None
         self.permitted_children = permitted_children
         # Wait to actually create the directories until needed.
@@ -617,9 +805,9 @@ class Tile:
             else:
                 d[t] = tab[t]
 
-        if self.randomize > 0:
+        if self.quadtree.randomize > 0:
             # Optional circular jitter to avoid overplotting.
-            rho = nprandom.normal(0, self.randomize, tab.shape[0])
+            rho = nprandom.normal(0, self.quadtree.randomize, tab.shape[0])
             theta = nprandom.uniform(0, 2 * np.pi, tab.shape[0])
             d["x"] = pc.add(d["x"], pc.multiply(rho, pc.cos(theta)))
             d["y"] = pc.add(d["y"], pc.multiply(rho, pc.sin(theta)))
@@ -697,7 +885,7 @@ class Tile:
         if self._filename is not None:
             return self._filename
         local_name = Path(*map(str, self.coords)).with_suffix(".feather")
-        dest_file = self.basedir / local_name
+        dest_file = self.quadtree.basedir / local_name
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         self._filename = dest_file
         return self._filename
@@ -891,7 +1079,6 @@ class Tile:
                 child = Tile(
                     quadtree=self.quadtree,
                     extent=extent,
-                    basedir=self.basedir,
                     tile_code=coords,
                     parent=self,
                     permitted_children=child_permission[i * 2 + j],
@@ -982,6 +1169,12 @@ class Tile:
         schemas = self.quadtree.schemas
         return {k: table.select(schemas[k].names) for k in cars}
 
+    def read_column(self, column: str, sidecar: Optional[str]) -> pa.Array:
+        fname = self.filename
+        if sidecar is not None:
+            fname = self.filename.with_suffix(f".{sidecar}.feather")
+        return feather.read_table(fname, columns=[column])[column]
+
 
 def get_better_codes(col, counter=Counter()):
     for a in pc.value_counts(col):
@@ -1028,6 +1221,14 @@ def rebatch(input: Iterator[pa.RecordBatch], size: float) -> Iterator[pa.Table]:
         yield pa.Table.from_batches(buffer)
 
 
-if __name__ == "__main__":
+def cli():
     args = parse_args()
+    if args["log_level"]:
+        logger.setLevel(args["log_level"])
+        del args["log_level"]
+
     main(**args)
+
+
+if __name__ == "__main__":
+    cli()

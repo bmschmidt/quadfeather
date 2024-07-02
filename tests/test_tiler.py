@@ -172,13 +172,13 @@ class TestParquet:
     def test_big_parquet(self, tmp_path):
         size = 5_000_000
         demo_parquet(tmp_path / "test.parquet", size=size)
-        main(
+        qtree = main(
             files=[tmp_path / "test.parquet"],
             destination=tmp_path / "tiles",
             tile_size=5000,
             first_tile_size=1000,
         )
-        manifest = feather.read_table(tmp_path / "tiles" / "manifest.feather")
+        manifest = qtree.manifest_table
         assert pc.sum(manifest["nPoints"]).as_py() == size
         tb = feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
         ps = tb["ix"].to_pylist()
@@ -216,6 +216,31 @@ class TestStreaming:
         assert pc.sum(manifest["nPoints"]).as_py() == size
 
         tb = feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
+
+
+class TestAppends:
+    def test_join(self, tmp_path):
+        insert_data = pa.table(
+            {
+                "id": pa.array(np.arange(10_000)).cast(pa.string()),
+                "x": np.random.random(10_000),
+                "y": np.random.random(10_000),
+            }
+        )
+        qtree = Quadtree(
+            mode="write",
+            extent=((0, 1), (0, 1)),
+            max_open_filehandles=33,
+            basedir=tmp_path / "tiles",
+            tile_size=100,
+            first_tile_size=500,
+        )
+
+        qtree.insert(insert_data)
+
+        qtree.finalize()
+
+        qtree.build_bloom_index("id", None)
 
 
 if __name__ == "__main__":
