@@ -465,6 +465,7 @@ class Quadtree:
         if (size, parents) in self._macrotiles:
             return self._macrotiles[(size, parents)]
         self._macrotiles[(size, parents)] = [*self.iter_macrotiles(size, parents)]
+        return self._macrotiles[(size, parents)]
 
     @property
     def schemas(self) -> Dict[str, pa.Schema]:
@@ -541,51 +542,15 @@ class Quadtree:
         return feather.read_table(self.basedir / "manifest.feather")
 
     def build_bloom_index(self, id_field: str, id_sidecar: Optional[str], m=28, k=10):
+        """
+        Creates an index of bloom filters.
+        """
         # 24 and 11 are made up defaults here. I chose them
         # because I was on a plane and gpt4all suggested 20, 7.
 
         # Make id_field safe for filenames
-        id_field_enc = urlsafe_b64encode(id_field.encode("utf-8"))
-        bloom_filter_loc = (
-            self.basedir / "bloom_filters" / f"{m}-{k}"
-        )
-        each_takes = m / 4
-        assert (
-            32 - each_takes
-        ) > k, f"cannot have more than {(32 - each_takes)} hashes in bloom index"
-
-        for (z, x, y), tiles in self.iter_macrotile_order(2, 1):
-            bloom_filter_loc = bloom_filter_loc / f"{z}/{x}/{y}.{id_field_enc}.feather"
-            bloom_filter_loc.parent.mkdir(parents=True, exist_ok=True)
-            if bloom_filter_loc.exists():
-                continue
-            positions = np.zeros((2**m), np.bool8)
-            tilenames = []
-            for tile in tiles:
-                np.array(
-                    2**m,
-                )
-                col = tile.read_column(id_field, id_sidecar)
-                for item in col:
-                    bytes = item.as_py().encode("utf-8")
-                    hashed = hashlib.md5(bytes).hexdigest()
-                    for i in range(k):
-                        positions[int(hashed[i : i + each_takes], 16)] = True
-                tilenames.append(tile.key)
-
-            tb = pa.table(
-                {
-                    "key": pa.array([f"{z}/{x}/{y}"]),
-                    "children": pa.array([[tilenames]]),
-                    "bitmask": pa.array(positions, pa.list_(pa.bool_(), 2**m)),
-                }
-            )
-            # We write records of a single row at a time. This is wasteful,
-            # but the reason we're using arrow at all for these is to get bitmask-
-            # lists in a sane form, so it's not the end of the world.
-            bloom_filter_loc = bloom_filter_loc / f"{z}/{x}/{y}.{id_field_enc}.feather"
-            bloom_filter_loc.parent.mkdir(parents=True, exist_ok=True)
-            feather.write_feather(tb, bloom_filter_loc, compression = 'zstd')
+        for macrotile in self.iter_macrotiles(2, 1):
+            macrotile.build_bloom_filter(id_field, id_sidecar, m, k, 2, 1)
 
     def join(
         self,
@@ -599,6 +564,14 @@ class Quadtree:
         creates matched sidecars.
         """
 
+        for batch in data:
+            self.root_macrotile.insert_for_join(batch, key, key_sidecar_name, new_sidecar_name)
+        self.root_macrotile.complete_join(new_sidecar_name)
+
+    def root_macrotile(self, size : int, parents : int):
+        for file in self.macrotiles(size, parents):
+            return file
+        
     def iterate(
         self,
         top_down: bool = True,
@@ -674,14 +647,14 @@ class Macrotile:
                 potential_children.append(
                     (z, x * 2**self.size + i, y * 2**self.size + j)
                 )
-        all_tiles = {
+        all_macrotiles = {
             mt.coords: mt for mt in self.quadtree.macrotiles(self.size, self.parents)
         }
 
         children = []
         for coords in potential_children:
-            if coords in all_tiles:
-                children.append(all_tiles[coords])
+            if coords in all_macrotiles:
+                children.append(all_macrotiles[coords])
         return children
 
     def tiles(self) -> Iterator["Tile"]:
@@ -689,10 +662,68 @@ class Macrotile:
             if macrotile(tile.coords) == self.coords:
                 yield tile
 
-    def insert_join(self, batch, key):
+    def insert_for_join(self, key, key_sidecar_name, new_sidecar_name):
         pass
 
-    def bloom_filters(self, key):
+    def complete_join(self, new_sidecar_name):
+        pass
+
+    def composite_child_bloom_filters(self, key):
+        composite = None
+        for child in self.children():
+            if composite is None:
+                pass
+
+    def bloom_filter_loc(self, id_field : str, m : int, k: int):
+        (z, x, y) = self.coords
+        id_field_enc = urlsafe_b64encode(id_field.encode("utf-8"))
+        bloom_filter_loc = self.quadtree.basedir / "bloom_filters" / f"{m}-{k}" / f"{z}/{x}/{y}.{id_field_enc}.feather"
+        return bloom_filter_loc
+    def build_bloom_filter(self, id_field: str, id_sidecar: Optional[str], m : int, k: int, size, parents):
+        bloom_filter_loc = self.bloom_filter_loc(id_field, m, k)
+        bloom_filter_loc.parent.mkdir(parents=True, exist_ok=True)
+        if bloom_filter_loc.exists():
+            return
+        
+        each_takes = m / 4
+        assert (
+            32 - each_takes
+        ) > k, f"cannot have more than {(32 - each_takes)} hashes in bloom index"
+
+
+        # Use a bool8 in numpy to actually build the filter.
+        # this takes 8x as much space as we need, but IDK a robust
+        # fast way to twiddle individual bits in python.
+
+        positions = np.zeros((2**m), np.bool8)
+        tilenames = []
+        for tile in self.tiles():
+            col = tile.read_column(id_field, id_sidecar)
+            if not pa.types.is_string(col.type):
+                col = col.cast(pa.string())
+            for item in col:
+                # Retrieve 
+                bytes = item.as_buffer().to_pybytes()
+                hashed = hashlib.md5(bytes).hexdigest()
+                for i in range(k):
+                    hash = int(hashed[i : i + each_takes], 16)
+                    positions[hash] = True
+            tilenames.append(tile.key)
+        (z, x, y) = self.coords
+        tb = pa.table(
+            {
+                "key": pa.array([f"{z}/{x}/{y}"]),
+                "tiles": pa.array([[tilenames]]),
+                "bitmask": pa.array(positions, pa.list_(pa.bool_(), 2**m)),
+            }
+        )
+        # We write records of a single row at a time. This is wasteful,
+        # but the reason we're using arrow at all for these is to get bitmask-
+        # lists in a sane form, so it's not the end of the world.
+        self.bloom_filter_loc.parent.mkdir(parents=True, exist_ok=True)
+        feather.write_feather(tb, bloom_filter_loc, compression = 'zstd')
+
+    def bloom_filter(self, key):
 
     def finalize_join_insert(self, key):
 
