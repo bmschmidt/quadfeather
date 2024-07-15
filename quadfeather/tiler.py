@@ -514,13 +514,12 @@ class Quadtree:
             fields = [*fields, *sidecar]
         return pa.schema(fields)
 
-    def read_root_table(self, suffix: str = ""):
+    def read_root_table(self, suffix: Optional[str] = ""):
         path = self.basedir / "0/0/0"
-        if suffix != "":
+        if suffix != "" and suffix is not None:
             path = path.with_suffix(f".{suffix}.feather")
         else:
             path = path.with_suffix(".feather")
-
         return feather.read_table(path)
 
     def finalize(self):
@@ -550,28 +549,33 @@ class Quadtree:
 
         # Make id_field safe for filenames
         for macrotile in self.iter_macrotiles(2, 1):
-            macrotile.build_bloom_filter(id_field, id_sidecar, m, k, 2, 1)
+            macrotile.build_bloom_filter(id_field, m, k)
 
     def join(
         self,
         data: Iterator[pa.Table],
-        key: str,
-        key_sidecar_name: Union[str, None],
+        id_field: str,
         new_sidecar_name: str,
+        key_sidecar_name: Union[str, None] = None,
+        m=24,
+        k=2,
     ):
         """
         Given an iterator of data with a keyed field 'key' already present,
         creates matched sidecars.
         """
 
-        for batch in data:
-            self.root_macrotile.insert_for_join(batch, key, key_sidecar_name, new_sidecar_name)
-        self.root_macrotile.complete_join(new_sidecar_name)
+        root = self.root_macrotile(2, 1)
+        if root is None:
+            raise ValueError("No root macrotile found.")
+        for tb in data:
+            root.insert_for_join(tb, id_field, m, k)
+        root.complete_join(id_field, m, k, new_sidecar_name)
 
-    def root_macrotile(self, size : int, parents : int):
+    def root_macrotile(self, size: int, parents: int):
         for file in self.macrotiles(size, parents):
             return file
-        
+
     def iterate(
         self,
         top_down: bool = True,
@@ -637,6 +641,25 @@ class Macrotile:
         self.size = size
         self.parents = parents
         self._tiles = tiles
+        self._open_filehandles: Dict[
+            Path, Union[ipc.RecordBatchFileWriter, pq.ParquetWriter]
+        ] = {}
+        self._file_handles_needing_closure: Set[Path] = set()
+
+    def write_batch_to_filehandle(self, path: Path, batch: pa.Table):
+        if not path in self._open_filehandles:
+            if path.suffix == ".feather":
+                self._open_filehandles[path] = ipc.new_file(path, schema=batch.schema)
+            elif path.suffix == ".parquet":
+                self._open_filehandles[path] = pq.ParquetWriter(
+                    path, schema=batch.schema
+                )
+            else:
+                raise NotImplementedError(
+                    path.suffix + " is not a supported file format"
+                )
+        # will fail if the schema changes.
+        self._open_filehandles[path].write_table(batch)
 
     def children(self) -> List["Macrotile"]:
         potential_children = []
@@ -662,34 +685,23 @@ class Macrotile:
             if macrotile(tile.coords) == self.coords:
                 yield tile
 
-    def insert_for_join(self, key, key_sidecar_name, new_sidecar_name):
-        pass
-
-    def complete_join(self, new_sidecar_name):
-        pass
-
-    def composite_child_bloom_filters(self, key):
-        composite = None
-        for child in self.children():
-            if composite is None:
-                pass
-
-    def bloom_filter_loc(self, id_field : str, m : int, k: int):
+    def bloom_filter_loc(self, id_field: str, m: int, k: int):
         (z, x, y) = self.coords
-        id_field_enc = urlsafe_b64encode(id_field.encode("utf-8"))
-        bloom_filter_loc = self.quadtree.basedir / "bloom_filters" / f"{m}-{k}" / f"{z}/{x}/{y}.{id_field_enc}.feather"
+        # Make sure the id_field is filename safe
+        id_field_enc = urlsafe_b64encode(id_field.encode("utf-8")).decode("utf-8")
+        bloom_filter_loc = (
+            self.quadtree.basedir
+            / "bloom_filters"
+            / f"{m}-{k}"
+            / f"{z}/{x}/{y}.{id_field_enc}.feather"
+        )
         return bloom_filter_loc
-    def build_bloom_filter(self, id_field: str, id_sidecar: Optional[str], m : int, k: int, size, parents):
+
+    def build_bloom_filter(self, id_field: str, m: int, k: int):
         bloom_filter_loc = self.bloom_filter_loc(id_field, m, k)
         bloom_filter_loc.parent.mkdir(parents=True, exist_ok=True)
         if bloom_filter_loc.exists():
             return
-        
-        each_takes = m / 4
-        assert (
-            32 - each_takes
-        ) > k, f"cannot have more than {(32 - each_takes)} hashes in bloom index"
-
 
         # Use a bool8 in numpy to actually build the filter.
         # this takes 8x as much space as we need, but IDK a robust
@@ -697,37 +709,223 @@ class Macrotile:
 
         positions = np.zeros((2**m), np.bool8)
         tilenames = []
+        id_sidecar = self.quadtree.sidecars.get(id_field, None)
+
         for tile in self.tiles():
             col = tile.read_column(id_field, id_sidecar)
+            # Integers are hashed as strings. Not ideal.
             if not pa.types.is_string(col.type):
                 col = col.cast(pa.string())
+
             for item in col:
-                # Retrieve 
+                # Retrieve the bytes of the string.
                 bytes = item.as_buffer().to_pybytes()
-                hashed = hashlib.md5(bytes).hexdigest()
-                for i in range(k):
-                    hash = int(hashed[i : i + each_takes], 16)
-                    positions[hash] = True
+                # Hash it with md5
+                hashed = bloom_hash(bytes, m, k)
+                # Set the k positions in the fiter to true.
+                positions[hashed] = True
             tilenames.append(tile.key)
+
         (z, x, y) = self.coords
+
         tb = pa.table(
             {
                 "key": pa.array([f"{z}/{x}/{y}"]),
                 "tiles": pa.array([[tilenames]]),
-                "bitmask": pa.array(positions, pa.list_(pa.bool_(), 2**m)),
+                "bitmask": pa.array([positions], pa.list_(pa.bool_(), 2**m)),
             }
         )
+
         # We write records of a single row at a time. This is wasteful,
         # but the reason we're using arrow at all for these is to get bitmask-
         # lists in a sane form, so it's not the end of the world.
-        self.bloom_filter_loc.parent.mkdir(parents=True, exist_ok=True)
-        feather.write_feather(tb, bloom_filter_loc, compression = 'zstd')
 
-    def bloom_filter(self, key):
+        self.bloom_filter_loc(id_field, m, k).parent.mkdir(parents=True, exist_ok=True)
+        feather.write_feather(tb, bloom_filter_loc, compression="zstd")
 
-    def finalize_join_insert(self, key):
+    def matched_file_loc(self, id_field, m, k):
+        """
+        The location to which we write files that match the bloom filter here.
+        """
+        return self.bloom_filter_loc(id_field, m, k).with_suffix(".matches.parquet")
 
-    def complete_join(self, key, sidecar_name)
+    def candidate_file_loc(self, id_field, m, k):
+        """
+        Differs from 'matched_file_loc' because this file applies not just the
+        macrotiles filter, but filters for all macrotiles *beneath* it.
+        """
+        return self.bloom_filter_loc(id_field, m, k).with_suffix(".candidates.parquet")
+
+    def bloom_filter(self, id_field, m, k):
+        loc = self.bloom_filter_loc(id_field, m, k)
+        if not loc.exists():
+            self.build_bloom_filter(id_field, m, k)
+        tb = feather.read_table(loc)
+        return pc.list_flatten(tb.take([0])["bitmask"])
+
+    def bloom_filters_below_here(self, id_field, m, k, inclusive=True):
+        """
+        Returns a single bloom filter which combines together all bloom filters
+        below, NOT including this one.
+        """
+        if inclusive:
+            total_filter = self.bloom_filter(id_field, m, k)
+        else:
+            total_filter = pa.array(np.zeros(2**m), pa.bool_())
+        children = self.children()
+        while len(children) > 0:
+            child = children.pop()
+            filter = child.bloom_filter(id_field, m, k)
+            total_filter = pc.or_(total_filter, filter)
+            # Descend the tree
+            children = [*children, *child.children()]
+        return total_filter
+
+    def insert_for_join(self, tb: pa.Table, id_field, m: int, k: int):
+        """
+
+        key: the join key.
+
+        """
+        assert id_field in tb.column_names, "Table must include identifier key"
+
+        # We're going to divide the data across 21 possible places.
+        # 1. A candidate file for this macrotile, because.
+        # 2. A candidate file for the macrotile of the children of this tile
+        # 3. A candidate file for each of the grandchildren of this tile, INCLUSIVE
+        #    of any of their children.
+        # Since Bloom filters are not exact, it is possible and expected that
+        # a row might be written to multiple output locations.
+
+        # At m = 24, this will take 336 MB of memory to hold the filters.
+        # at m = 28, this will take 5.3 GB of memory to hold the filters.
+
+        tb = tb.filter(pc.invert(pc.is_null(tb[id_field])))
+        id_col = tb[id_field]
+
+        # Pre-allocated a table to hold the hash for each column.
+        hashes = np.zeros((len(tb), k), np.uint32)
+        if not pa.types.is_string(id_col.type):
+            id_col = id_col.cast(pa.string())
+        for i, item in enumerate(tb[id_field]):
+            bytes = item.as_buffer().to_pybytes()
+            hashes[i] = bloom_hash(bytes, m, k)
+
+        for macrotile in [self, *self.children()]:
+            bloom_filter = macrotile.bloom_filter(id_field, m, k)
+            matches = []
+            for i, hash in enumerate(hashes):
+                if pc.all(bloom_filter.take(hash)).as_py():
+                    matches.append(i)
+            if len(matches) > 0:
+                subset = tb.take(matches)
+                path = macrotile.matched_file_loc(id_field, m, k)
+                macrotile.write_batch_to_filehandle(path, subset)
+
+        for child in self.children():
+            for grandchild in child.children():
+                bloom_filter = grandchild.bloom_filters_below_here(id_field, m, k)
+                matches = []
+                for i, hash in enumerate(hashes):
+                    if np.all(bloom_filter[hash]):
+                        matches.append(i)
+                if len(matches) > 0:
+                    subset = tb.take(matches)
+                    path = macrotile.candidate_file_loc(id_field, m, k)
+                    macrotile.write_batch_to_filehandle(path, subset)
+
+    def close_filehandles(self, recursive=True):
+        for path, file in [*self._open_filehandles.items()]:
+            file.close()
+            self._file_handles_needing_closure.add(path)
+            del self._open_filehandles[path]
+        if recursive:
+            for child in self.children():
+                child.close_filehandles()
+
+    def complete_candidate_insertion(self, id_field, m: int, k: int):
+        if self.candidate_file_loc(id_field, m, k).exists():
+            if len(self.children()) == 0:
+                # If it has no children, this actually is a match file. So we can rename and exit.
+                self.candidate_file_loc(id_field, m, k).rename(
+                    self.matched_file_loc(id_field, m, k)
+                )
+                return
+            fin = pq.ParquetFile(self.candidate_file_loc(id_field, m, k))
+            for batch in fin.iter_batches():
+                self.insert_for_join(pa.Table.from_batches([batch]), id_field, m, k)
+            self.close_filehandles()
+            self.candidate_file_loc(id_field, m, k).unlink()
+
+        # And recurse.
+        for child in self.children():
+            child.complete_candidate_insertion(id_field, m, k)
+            child.close_filehandles()
+
+    def complete_join(self, id_field, m, k, new_sidecar_name):
+
+        # Called once all the record batches of a join have been inserted.
+
+        # It's bad to have lots of filehandles lagging open,
+        # so close everything first.
+        self.close_filehandles(recursive=True)
+
+        # Identify where in the original dataset this table comes from
+        try:
+            sidecar = self.quadtree.sidecars[id_field]
+        except KeyError:
+            sidecar = None
+        if (
+            self.candidate_file_loc(id_field, m, k)
+            in self._file_handles_needing_closure
+        ):
+            self.complete_candidate_insertion(id_field, m, k)
+
+        if self.matched_file_loc(id_field, m, k) in self._file_handles_needing_closure:
+            for tile in self.tiles():
+                ids = tile.read_column(id_field, sidecar)
+                # Read *only* the relevant parts of the parquet file.
+                matches = pq.read_table(
+                    self.matched_file_loc(id_field, m, k),
+                    filters=[(id_field, "in", ids)],
+                )
+                sort_indices = pc.index_in(ids, matches[id_field])
+
+                dest = tile.filename.with_suffix(f".{new_sidecar_name}.feather")
+                feather.write_feather(
+                    matches.take(sort_indices).drop([id_field]),
+                    dest,
+                    compression="uncompressed",
+                )
+
+
+def bloom_hash(val: bytes, m: int, k: int) -> np.ndarray:
+    """
+    Hash bytes
+    Hashes a value val in k buckets out of 2**m total buckets.
+
+    returns: a numpy integer array of length k indicating which numbers are set.
+    """
+
+    # Rather than actually hash m times for the bloom filter, we make a single
+    # md5 hash which is 32 bytes, and then take slices of that offset by one byte
+    # at a time to represent the different hash functions. So if there are
+    #
+
+    # Should this be 4 or 8?
+    each_takes = int(m / 4)
+    assert (
+        32 - each_takes
+    ) > k, f"cannot have more than {(32 - each_takes)} hashes in bloom index"
+
+    vals = np.zeros(k, np.uint32)
+    hashed = hashlib.md5(val).hexdigest()
+    # Since we're
+    for i in range(k):
+        hash = int(hashed[i : i + each_takes], 16)
+        vals[i] = hash
+    return vals
+
 
 def macrotile(key: Tuple[int, int, int], size=2, parents=2) -> Tuple[int, int, int]:
 

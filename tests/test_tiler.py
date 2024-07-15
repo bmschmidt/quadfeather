@@ -219,6 +219,70 @@ class TestStreaming:
 
 
 class TestAppends:
+    def test_build_index(self, tmp_path):
+        insert_data = pa.table(
+            {
+                "id": pa.array(np.arange(10_000)).cast(pa.string()),
+                "x": np.random.random(10_000),
+                "y": np.random.random(10_000),
+            }
+        )
+        qtree = Quadtree(
+            mode="write",
+            extent=((0, 1), (0, 1)),
+            max_open_filehandles=33,
+            basedir=tmp_path / "tiles",
+            tile_size=100,
+            first_tile_size=50,
+        )
+
+        qtree.insert(insert_data)
+
+        qtree.finalize()
+
+        qtree.build_bloom_index("id", None)
+
+    def test_join_onfile(self, tmp_path):
+        insert_data = pa.table(
+            {
+                "id": pa.array(np.arange(10_000)).cast(pa.string()),
+                "x": np.random.random(10_000),
+                "y": np.random.random(10_000),
+            }
+        )
+        qtree = Quadtree(
+            mode="write",
+            extent=((0, 1), (0, 1)),
+            max_open_filehandles=33,
+            basedir=tmp_path / "tiles",
+            tile_size=65_000,
+            first_tile_size=65_000,
+        )
+
+        qtree.insert(insert_data)
+
+        qtree.finalize()
+
+        ids = pa.array(np.arange(10_000)).cast(pa.string())
+        insert_tb = pa.table({"id": ids, "join_field": ids})
+        # Shuffle the insert table.
+        shuffled_indices = np.random.permutation(len(insert_tb))
+        insert_tb = insert_tb.take(pa.array(shuffled_indices))
+
+        def stream():
+            start = 0
+            while start < len(insert_tb):
+                yield insert_tb.take(np.arange(start, start + 1000))
+                start += 1000
+
+        qtree.join(stream(), "id", "new_sidecar", None)
+        m = qtree.read_root_table("new_sidecar")
+        root_ids = qtree.read_root_table(None)["id"]
+        assert not "id" in m.column_names
+        assert "join_field" in m.column_names
+
+        assert (pc.all(pc.equal(m["join_field"], root_ids))).as_py()
+
     def test_join(self, tmp_path):
         insert_data = pa.table(
             {
@@ -233,18 +297,38 @@ class TestAppends:
             max_open_filehandles=33,
             basedir=tmp_path / "tiles",
             tile_size=100,
-            first_tile_size=500,
+            first_tile_size=50,
         )
 
         qtree.insert(insert_data)
 
         qtree.finalize()
 
-        qtree.build_bloom_index("id", None)
+        ids = pa.array(np.arange(10_000)).cast(pa.string())
+        insert_tb = pa.table({"id": ids, "join_field": ids})
+        # Shuffle the insert table.
+        shuffled_indices = np.random.permutation(len(insert_tb))
+        insert_tb = insert_tb.take(pa.array(shuffled_indices))
+
+        def stream():
+            start = 0
+            while start < len(insert_tb):
+                yield insert_tb.take(np.arange(start, start + 1000))
+                start += 1000
+
+        qtree.join(stream(), "id", "new_sidecar", None)
+        m = qtree.read_root_table("new_sidecar")
+        root_ids = qtree.read_root_table(None)["id"]
+        assert not "id" in m.column_names
+        assert "join_field" in m.column_names
+
+        assert (pc.all(pc.equal(m["join_field"], root_ids))).as_py()
 
 
 if __name__ == "__main__":
     logger = logging.getLogger("quadfeather")
     logger.setLevel(level=logging.DEBUG)
-    t = TestStreaming()
-    t.test_streaming_batches(tmp_path=Path("tmp"))
+    # t = TestStreaming()
+    # t.test_streaming_batches(tmp_path=Path("tmp"))
+    t = TestAppends()
+    t.test_join(tmp_path=Path("tmp"))
