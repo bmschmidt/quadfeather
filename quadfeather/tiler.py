@@ -3,6 +3,7 @@ from pyarrow import csv, feather, parquet as pq, compute as pc, ipc as ipc
 
 # import pandas as pd
 import logging
+import functools
 from pathlib import Path
 import sys
 import argparse
@@ -440,7 +441,6 @@ class Quadtree:
             raise NotImplementedError("Only write mode is supported right now.")
         self.sidecars = sidecars
         self._insert_schema = None
-
         if isinstance(extent, tuple):
             extent = Rectangle(x=extent[0], y=extent[1])
         self.schema = schema
@@ -453,7 +453,8 @@ class Quadtree:
                 tile_code=(0, 0, 0),
             )
         self._tiles = None
-        self._macrotiles: Dict[Tuple[int, int], List[Macrotile]] = {}
+        self._macrotiles: Optional[List[Macrotile]] = None
+        self._bloom_cache: Dict[str, pa.Array] = {}
 
     def tiles(self):
         if self._tiles is not None:
@@ -461,11 +462,12 @@ class Quadtree:
         self._tiles = [*self.iterate()]
         return self._tiles
 
-    def macrotiles(self, size: int, parents: int):
-        if (size, parents) in self._macrotiles:
-            return self._macrotiles[(size, parents)]
-        self._macrotiles[(size, parents)] = [*self.iter_macrotiles(size, parents)]
-        return self._macrotiles[(size, parents)]
+    @property
+    def macrotiles(self):
+        if self._macrotiles is not None:
+            return self._macrotiles
+        self._macrotiles = [*self.iter_macrotiles()]
+        return self._macrotiles
 
     @property
     def schemas(self) -> Dict[str, pa.Schema]:
@@ -548,7 +550,7 @@ class Quadtree:
         # because I was on a plane and gpt4all suggested 20, 7.
 
         # Make id_field safe for filenames
-        for macrotile in self.iter_macrotiles(2, 1):
+        for macrotile in self.macrotiles:
             macrotile.build_bloom_filter(id_field, m, k)
 
     def join(
@@ -565,16 +567,20 @@ class Quadtree:
         creates matched sidecars.
         """
 
-        root = self.root_macrotile(2, 1)
+        root = self.root_macrotile
         if root is None:
             raise ValueError("No root macrotile found.")
         for tb in data:
             root.insert_for_join(tb, id_field, m, k)
         root.complete_join(id_field, m, k, new_sidecar_name)
 
-    def root_macrotile(self, size: int, parents: int):
-        for file in self.macrotiles(size, parents):
-            return file
+    @property
+    def root_macrotile(self):
+        # It's just the first one in the iterated list.
+        for file in self.macrotiles:
+            if file.coords == (0, 0, 0):
+                return file
+        raise ValueError("No root macrotile found.")
 
     def iterate(
         self,
@@ -599,9 +605,7 @@ class Quadtree:
             z, x, y = to_check.pop(0)
             if (z, x, y) in lookups:
                 ordered_list.append((z, x, y))
-                possible_children = [
-                    (z + 1, x + i, y + j) for i in (0, 1) for j in (0, 1)
-                ]
+                possible_children = children((z, x, y))
                 if breadth_firth:
                     to_check.extend(possible_children)
                 else:
@@ -612,17 +616,17 @@ class Quadtree:
             yield Tile(self, extent=lookups[key], tile_code=key, mode=mode)
 
     def iter_macrotile_order(
-        self, size=2, parents=2
+        self,
     ) -> Iterator[Tuple[Tuple[int, int, int], List["Tile"]]]:
         macros = defaultdict(list)
         for tile in self.iterate(top_down=True):
-            macros[macrotile(tile.coords, size, parents)].append(tile)
+            macros[macrotile(tile.coords)].append(tile)
         for coords, tiles in macros.items():
             yield (coords, tiles)
 
-    def iter_macrotiles(self, size: int, parents: int):
-        for key, tiles in self.iter_macrotile_order(size, parents):
-            t = Macrotile(self, key, size, parents, tiles)
+    def iter_macrotiles(self):
+        for key, tiles in self.iter_macrotile_order():
+            t = Macrotile(self, key, tiles)
             yield t
 
 
@@ -631,20 +635,21 @@ class Macrotile:
         self,
         quadtree: Quadtree,
         coords: Tuple[int, int, int],
-        size: int,
-        parents: int,
         tiles: Optional[List["Tile"]] = None,
+        parent=None,
     ):
-        assert size % parents == 0
+        assert coords[0] % 2 == 0
         self.quadtree = quadtree
         self.coords = coords
-        self.size = size
-        self.parents = parents
         self._tiles = tiles
         self._open_filehandles: Dict[
             Path, Union[ipc.RecordBatchFileWriter, pq.ParquetWriter]
         ] = {}
         self._file_handles_needing_closure: Set[Path] = set()
+        if parent is None:
+            self.parent = None
+        else:
+            self.parent = parent
 
     def write_batch_to_filehandle(self, path: Path, batch: pa.Table):
         if not path in self._open_filehandles:
@@ -663,22 +668,15 @@ class Macrotile:
 
     def children(self) -> List["Macrotile"]:
         potential_children = []
-        z, x, y = self.coords
-        z += self.parents
-        for i in range(0, 2**self.size):
-            for j in range(0, 2**self.size):
-                potential_children.append(
-                    (z, x * 2**self.size + i, y * 2**self.size + j)
-                )
-        all_macrotiles = {
-            mt.coords: mt for mt in self.quadtree.macrotiles(self.size, self.parents)
-        }
-
-        children = []
+        for child in children(self.coords):
+            for grandchild in children(child):
+                potential_children.append(grandchild)
+        all_macrotiles = {mt.coords: mt for mt in self.quadtree.macrotiles}
+        actual_children = []
         for coords in potential_children:
             if coords in all_macrotiles:
-                children.append(all_macrotiles[coords])
-        return children
+                actual_children.append(all_macrotiles[coords])
+        return actual_children
 
     def tiles(self) -> Iterator["Tile"]:
         for tile in self.quadtree.iterate(top_down=True):
@@ -706,6 +704,8 @@ class Macrotile:
         # Use a bool8 in numpy to actually build the filter.
         # this takes 8x as much space as we need, but IDK a robust
         # fast way to twiddle individual bits in python.
+
+        # At *read* time, we are carefuly to use bitmasks.
 
         positions = np.zeros((2**m), np.bool8)
         tilenames = []
@@ -759,6 +759,7 @@ class Macrotile:
     def bloom_filter(self, id_field, m, k):
         loc = self.bloom_filter_loc(id_field, m, k)
         if not loc.exists():
+            print("MAKING BLOOM FILTER", self.coords, id_field, m, k)
             self.build_bloom_filter(id_field, m, k)
         tb = feather.read_table(loc)
         return pc.list_flatten(tb.take([0])["bitmask"])
@@ -812,7 +813,10 @@ class Macrotile:
             hashes[i] = bloom_hash(bytes, m, k)
 
         for macrotile in [self, *self.children()]:
-            bloom_filter = macrotile.bloom_filter(id_field, m, k)
+            key = str(macrotile.bloom_filter_loc(id_field, m, k))
+            if not key in self.quadtree._bloom_cache:
+                self.quadtree._bloom_cache[key] = macrotile.bloom_filter(id_field, m, k)
+            bloom_filter = self.quadtree._bloom_cache[key]
             matches = []
             for i, hash in enumerate(hashes):
                 if pc.all(bloom_filter.take(hash)).as_py():
@@ -822,12 +826,22 @@ class Macrotile:
                 path = macrotile.matched_file_loc(id_field, m, k)
                 macrotile.write_batch_to_filehandle(path, subset)
 
+        # for grandchildren, insert everything below here.
         for child in self.children():
             for grandchild in child.children():
-                bloom_filter = grandchild.bloom_filters_below_here(id_field, m, k)
+                key = (
+                    str(grandchild.bloom_filter_loc(id_field, m, k))
+                    + "_with_descendants"
+                )
+                if not key in self.quadtree._bloom_cache:
+                    self.quadtree._bloom_cache[key] = (
+                        grandchild.bloom_filters_below_here(id_field, m, k)
+                    )
+
+                bloom_filter = self.quadtree._bloom_cache[key]
                 matches = []
                 for i, hash in enumerate(hashes):
-                    if np.all(bloom_filter[hash]):
+                    if pc.all(bloom_filter.take(hash)):
                         matches.append(i)
                 if len(matches) > 0:
                     subset = tb.take(matches)
@@ -844,6 +858,8 @@ class Macrotile:
                 child.close_filehandles()
 
     def complete_candidate_insertion(self, id_field, m: int, k: int):
+        print("completing", self.coords)
+
         if self.candidate_file_loc(id_field, m, k).exists():
             if len(self.children()) == 0:
                 # If it has no children, this actually is a match file. So we can rename and exit.
@@ -854,13 +870,12 @@ class Macrotile:
             fin = pq.ParquetFile(self.candidate_file_loc(id_field, m, k))
             for batch in fin.iter_batches():
                 self.insert_for_join(pa.Table.from_batches([batch]), id_field, m, k)
-            self.close_filehandles()
             self.candidate_file_loc(id_field, m, k).unlink()
+            self.close_filehandles()
 
         # And recurse.
         for child in self.children():
             child.complete_candidate_insertion(id_field, m, k)
-            child.close_filehandles()
 
     def complete_join(self, id_field, m, k, new_sidecar_name):
 
@@ -875,11 +890,9 @@ class Macrotile:
             sidecar = self.quadtree.sidecars[id_field]
         except KeyError:
             sidecar = None
-        if (
-            self.candidate_file_loc(id_field, m, k)
-            in self._file_handles_needing_closure
-        ):
-            self.complete_candidate_insertion(id_field, m, k)
+
+        # Recursively flush any candidate files holding lots of points.
+        self.complete_candidate_insertion(id_field, m, k)
 
         if self.matched_file_loc(id_field, m, k) in self._file_handles_needing_closure:
             for tile in self.tiles():
@@ -897,6 +910,9 @@ class Macrotile:
                     dest,
                     compression="uncompressed",
                 )
+
+        for mychild in self.children():
+            mychild.complete_join(id_field, m, k, new_sidecar_name)
 
 
 def bloom_hash(val: bytes, m: int, k: int) -> np.ndarray:
@@ -927,17 +943,22 @@ def bloom_hash(val: bytes, m: int, k: int) -> np.ndarray:
     return vals
 
 
-def macrotile(key: Tuple[int, int, int], size=2, parents=2) -> Tuple[int, int, int]:
+def children(coords: Tuple[int, int, int]):
+    z, x, y = coords
+    return [(z + 1, x * 2 + i, y * 2 + j) for i in (0, 1) for j in (0, 1)]
 
-    assert size % parents == 0
-    z, x, y = key
-    moves = 0
-    while not (moves >= parents and z % size == 0):
-        x = int(x / 2)
-        y = int(y / 2)
-        z = z - 1
-        moves += 1
-    return (z, x, y)
+
+def parent(coords: Tuple[int, int, int]):
+    z, x, y = coords
+    return (z - 1, x // 2, y // 2)
+
+
+def macrotile(coords: Tuple[int, int, int]) -> Tuple[int, int, int]:
+    if coords[0] == 0:
+        return (0, 0, 0)
+    if coords[0] % 2 == 0:
+        return parent(parent(coords))
+    return parent(coords)
 
 
 class Tile:

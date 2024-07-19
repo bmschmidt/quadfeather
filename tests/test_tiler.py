@@ -86,12 +86,14 @@ class TestCSV:
             fout.write(f"x,y,number,cat\n")
             # Write 10,000 of each category to see if the later ones throw a dictionary error.
             rows = []
-            for key, count in [
-                ("apple", 10_000),
-                ("banana", 1_000),
-                ("strawberry", 100),
-                ("mulberry", 10),
-            ]:
+            desired_counts = {
+                "apple": 10_000,
+                "banana": 1_000,
+                "strawberry": 100,
+                "mulberry": 10,
+            }
+
+            for key, count in desired_counts.items():
                 for _ in range(count):
                     rows.append(
                         f"{random.random()},{random.random()},{random.randint(0, 100)},{key}\n"
@@ -115,7 +117,13 @@ class TestCSV:
             batches.append(feather.read_table(fin))
 
         alltogether = pa.concat_tables(batches)
-        counts = alltogether["cat"].value_counts().to_pydict()
+
+        # Ensure that the sidecars contain the correct number of
+        # values for the categories we inserted
+        counts = alltogether["cat"].value_counts().to_pylist()
+        assert len(counts) == len(desired_counts)
+        for row in counts:
+            assert desired_counts[row["values"]] == row["counts"]
 
     def test_if_break_categorical_chunks(self, tmp_path):
         input = tmp_path / "test.csv"
@@ -219,7 +227,14 @@ class TestStreaming:
 
 
 class TestAppends:
+    """
+    Tests related
+    """
+
     def test_build_index(self, tmp_path):
+        """
+        Test the building of a bloom-filter based index
+        """
         insert_data = pa.table(
             {
                 "id": pa.array(np.arange(10_000)).cast(pa.string()),
@@ -232,8 +247,8 @@ class TestAppends:
             extent=((0, 1), (0, 1)),
             max_open_filehandles=33,
             basedir=tmp_path / "tiles",
-            tile_size=100,
             first_tile_size=50,
+            tile_size=100,
         )
 
         qtree.insert(insert_data)
@@ -242,7 +257,12 @@ class TestAppends:
 
         qtree.build_bloom_index("id", None)
 
-    def test_join_onfile(self, tmp_path):
+        qtree.basedir
+
+    def test_join_onefile(self, tmp_path):
+        """
+        A shorter join test with just one file.
+        """
         insert_data = pa.table(
             {
                 "id": pa.array(np.arange(10_000)).cast(pa.string()),
@@ -263,12 +283,13 @@ class TestAppends:
 
         qtree.finalize()
 
-        ids = pa.array(np.arange(10_000)).cast(pa.string())
+        ids = pa.array(np.arange(1_000_000)).cast(pa.string())
         insert_tb = pa.table({"id": ids, "join_field": ids})
         # Shuffle the insert table.
         shuffled_indices = np.random.permutation(len(insert_tb))
         insert_tb = insert_tb.take(pa.array(shuffled_indices))
 
+        # Construct an iterator to feed into the join function.
         def stream():
             start = 0
             while start < len(insert_tb):
@@ -284,27 +305,31 @@ class TestAppends:
         assert (pc.all(pc.equal(m["join_field"], root_ids))).as_py()
 
     def test_join(self, tmp_path):
+
+        NUM_POINTS = 10_000
         insert_data = pa.table(
             {
-                "id": pa.array(np.arange(10_000)).cast(pa.string()),
-                "x": np.random.random(10_000),
-                "y": np.random.random(10_000),
+                "id": pa.array(np.arange(NUM_POINTS)).cast(pa.string()),
+                "x": np.random.random(NUM_POINTS),
+                "y": np.random.random(NUM_POINTS),
             }
         )
+        TILE_SIZE = 100
         qtree = Quadtree(
             mode="write",
             extent=((0, 1), (0, 1)),
             max_open_filehandles=33,
             basedir=tmp_path / "tiles",
-            tile_size=100,
-            first_tile_size=50,
+            tile_size=TILE_SIZE,
+            first_tile_size=int(TILE_SIZE / 4),
         )
 
         qtree.insert(insert_data)
 
         qtree.finalize()
 
-        ids = pa.array(np.arange(10_000)).cast(pa.string())
+        print("INSERT DONE")
+        ids = pa.array(np.arange(NUM_POINTS)).cast(pa.string())
         insert_tb = pa.table({"id": ids, "join_field": ids})
         # Shuffle the insert table.
         shuffled_indices = np.random.permutation(len(insert_tb))
@@ -313,16 +338,34 @@ class TestAppends:
         def stream():
             start = 0
             while start < len(insert_tb):
-                yield insert_tb.take(np.arange(start, start + 1000))
-                start += 1000
+                yield insert_tb.take(np.arange(start, start + int(NUM_POINTS / 1000)))
+                start += int(NUM_POINTS / 1000)
 
         qtree.join(stream(), "id", "new_sidecar", None)
+
+        ### First, we just confirm that the root table was correctly built.
         m = qtree.read_root_table("new_sidecar")
         root_ids = qtree.read_root_table(None)["id"]
         assert not "id" in m.column_names
         assert "join_field" in m.column_names
-
         assert (pc.all(pc.equal(m["join_field"], root_ids))).as_py()
+
+        # Then go through all the files.
+        num_files = 0
+        for t in qtree.tiles():
+            try:
+                # Most but not all files have a tile with an id column
+                root_ids = t.read_column("id", None)
+                num_files += 1
+            except:
+                continue
+            num_files += 1
+            joined_table = feather.read_table(
+                t.filename.with_suffix(".new_sidecar.feather")
+            )["join_field"]
+            assert (pc.all(pc.equal(joined_table, root_ids))).as_py()
+
+        assert num_files > NUM_POINTS / TILE_SIZE
 
 
 if __name__ == "__main__":
