@@ -228,12 +228,12 @@ class TestStreaming:
 
 class TestAppends:
     """
-    Tests related
+    Tests operations related to joins onto existing files.
     """
 
     def test_build_index(self, tmp_path):
         """
-        Test the building of a bloom-filter based index
+        Test the building of a bloom-filter based index.
         """
         insert_data = pa.table(
             {
@@ -255,9 +255,9 @@ class TestAppends:
 
         qtree.finalize()
 
-        qtree.build_bloom_index("id", None)
+        reloaded = Quadtree.from_dir(tmp_path / "tiles", mode="append")
 
-        qtree.basedir
+        reloaded.build_bloom_index("id", None)
 
     def test_join_onefile(self, tmp_path):
         """
@@ -296,7 +296,7 @@ class TestAppends:
                 yield insert_tb.take(np.arange(start, start + 1000))
                 start += 1000
 
-        qtree.join(stream(), "id", "new_sidecar", None)
+        qtree.join(stream(), "id", "new_sidecar")
         m = qtree.read_root_table("new_sidecar")
         root_ids = qtree.read_root_table(None)["id"]
         assert not "id" in m.column_names
@@ -304,9 +304,11 @@ class TestAppends:
 
         assert (pc.all(pc.equal(m["join_field"], root_ids))).as_py()
 
-    def test_join(self, tmp_path):
-
-        NUM_POINTS = 10_000
+    def test_join(self, tmp_path, NUM_POINTS=100_000, TILE_SIZE=1000):
+        """
+        This is a scale test, so num_points can be passed something arbitrarily large if we
+        want to make sure it works up to 100M points or whatever.
+        """
         insert_data = pa.table(
             {
                 "id": pa.array(np.arange(NUM_POINTS)).cast(pa.string()),
@@ -314,7 +316,6 @@ class TestAppends:
                 "y": np.random.random(NUM_POINTS),
             }
         )
-        TILE_SIZE = 100
         qtree = Quadtree(
             mode="write",
             extent=((0, 1), (0, 1)),
@@ -328,7 +329,6 @@ class TestAppends:
 
         qtree.finalize()
 
-        print("INSERT DONE")
         ids = pa.array(np.arange(NUM_POINTS)).cast(pa.string())
         insert_tb = pa.table({"id": ids, "join_field": ids})
         # Shuffle the insert table.
@@ -341,7 +341,7 @@ class TestAppends:
                 yield insert_tb.take(np.arange(start, start + int(NUM_POINTS / 1000)))
                 start += int(NUM_POINTS / 1000)
 
-        qtree.join(stream(), "id", "new_sidecar", None)
+        qtree.join(stream(), "id", "new_sidecar")
 
         ### First, we just confirm that the root table was correctly built.
         m = qtree.read_root_table("new_sidecar")
@@ -351,27 +351,31 @@ class TestAppends:
         assert (pc.all(pc.equal(m["join_field"], root_ids))).as_py()
 
         # Then go through all the files.
-        num_files = 0
+        matched = 0
         for t in qtree.tiles():
             try:
                 # Most but not all files have a tile with an id column
                 root_ids = t.read_column("id", None)
-                num_files += 1
-            except:
+            except FileNotFoundError:
                 continue
-            num_files += 1
             joined_table = feather.read_table(
                 t.filename.with_suffix(".new_sidecar.feather")
             )["join_field"]
+            # Is this individual tile correct?
             assert (pc.all(pc.equal(joined_table, root_ids))).as_py()
-
-        assert num_files > NUM_POINTS / TILE_SIZE
+            matched += len(joined_table)
+        # Did we find a match for every point?
+        assert matched == NUM_POINTS
 
 
 if __name__ == "__main__":
+    import sys
+
     logger = logging.getLogger("quadfeather")
     logger.setLevel(level=logging.DEBUG)
     # t = TestStreaming()
     # t.test_streaming_batches(tmp_path=Path("tmp"))
     t = TestAppends()
-    t.test_join(tmp_path=Path("tmp"))
+    t.test_join(
+        tmp_path=Path("tmp"), NUM_POINTS=int(sys.argv[1]), TILE_SIZE=int(sys.argv[2])
+    )

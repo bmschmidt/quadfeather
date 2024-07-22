@@ -53,6 +53,17 @@ class BatchIngester(Ingester):
         yield from self.batch_caller()
 
 
+class CSVIngester(Ingester):
+    def batches(self) -> Iterable[pa.RecordBatch]:
+        for file in self.files:
+            with open(file, "rb") as fin:
+                reader = csv.open_csv(fin, read_options=csv.ReadOptions())
+                for batch in reader:
+                    yield batch
+            if self.destructive:
+                file.unlink()
+
+
 class ArrowIngester(Ingester):
     """
     The IPC format, not the feather format.

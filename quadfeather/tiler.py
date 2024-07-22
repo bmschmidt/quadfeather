@@ -7,6 +7,7 @@ import functools
 from pathlib import Path
 import sys
 import argparse
+from io import BytesIO
 import json
 import hashlib
 from base64 import urlsafe_b64encode
@@ -85,7 +86,6 @@ def flatten_manifest(mani: TileManifest) -> List[Dict]:
 
 
 def parse_args():
-    print("foo")
     parser = argparse.ArgumentParser(
         description="Tile an input file into a large number of arrow files."
     )
@@ -437,8 +437,8 @@ class Quadtree:
         self.max_open_filehandles = max_open_filehandles
         self.mode = mode
         self.randomize = randomize
-        if mode != "write":
-            raise NotImplementedError("Only write mode is supported right now.")
+        # if mode != "write":
+        #     raise NotImplementedError("Only write mode is supported right now.")
         self.sidecars = sidecars
         self._insert_schema = None
         if isinstance(extent, tuple):
@@ -455,6 +455,33 @@ class Quadtree:
         self._tiles = None
         self._macrotiles: Optional[List[Macrotile]] = None
         self._bloom_cache: Dict[str, pa.Array] = {}
+
+    @staticmethod
+    def from_dir(basedir: Path, mode: Literal["read", "append"]) -> "Quadtree":
+        # Load a quadtree from disk.
+        manifest = basedir / "manifest.feather"
+        if not manifest.exists():
+            raise FileNotFoundError(
+                "Not able to load a quadtree without a manifest file."
+            )
+        manifest = feather.read_table(basedir / "manifest.feather")
+        sidecars = json.loads(manifest.schema.metadata[b"sidecars"])
+        schema = pa.ipc.read_schema(BytesIO(bytes(manifest.schema.metadata[b"schema"])))
+        extent = manifest.filter(pc.equal(manifest["key"], "0/0/0"))["extent"][
+            0
+        ].as_py()
+        loaded = json.loads(extent)
+        extent = Rectangle(
+            x=tuple(loaded["x"]),
+            y=tuple(loaded["y"]),
+        )
+        return Quadtree(
+            basedir=basedir,
+            extent=extent,
+            mode=mode,
+            sidecars=sidecars,
+            schema=schema,
+        )
 
     def tiles(self):
         if self._tiles is not None:
@@ -558,7 +585,6 @@ class Quadtree:
         data: Iterator[pa.Table],
         id_field: str,
         new_sidecar_name: str,
-        key_sidecar_name: Union[str, None] = None,
         m=24,
         k=2,
     ):
@@ -566,11 +592,12 @@ class Quadtree:
         Given an iterator of data with a keyed field 'key' already present,
         creates matched sidecars.
         """
-
         root = self.root_macrotile
         if root is None:
             raise ValueError("No root macrotile found.")
         for tb in data:
+            if isinstance(tb, pa.RecordBatch):
+                tb = pa.Table.from_batches([tb])
             root.insert_for_join(tb, id_field, m, k)
         root.complete_join(id_field, m, k, new_sidecar_name)
 
@@ -759,7 +786,7 @@ class Macrotile:
     def bloom_filter(self, id_field, m, k):
         loc = self.bloom_filter_loc(id_field, m, k)
         if not loc.exists():
-            print("MAKING BLOOM FILTER", self.coords, id_field, m, k)
+            logger.info("MAKING BLOOM FILTER", self.coords, id_field, m, k)
             self.build_bloom_filter(id_field, m, k)
         tb = feather.read_table(loc)
         return pc.list_flatten(tb.take([0])["bitmask"])
@@ -812,19 +839,24 @@ class Macrotile:
             bytes = item.as_buffer().to_pybytes()
             hashes[i] = bloom_hash(bytes, m, k)
 
+        hash_cols = pa.table({f"hash_{i}": pa.array(hashes[:, i]) for i in range(k)})
+        logger.debug("Inserting for join", self.coords, id_field, len(tb), m, k)
         for macrotile in [self, *self.children()]:
             key = str(macrotile.bloom_filter_loc(id_field, m, k))
             if not key in self.quadtree._bloom_cache:
                 self.quadtree._bloom_cache[key] = macrotile.bloom_filter(id_field, m, k)
             bloom_filter = self.quadtree._bloom_cache[key]
-            matches = []
-            for i, hash in enumerate(hashes):
-                if pc.all(bloom_filter.take(hash)).as_py():
-                    matches.append(i)
+            matches = tb
+            loc_hash_cols = hash_cols
+            for i in range(k):
+                # Go through the hashes in vectorized order.
+                is_match = bloom_filter.take(loc_hash_cols[f"hash_{i}"])
+                matches = matches.filter(is_match)
+                loc_hash_cols = loc_hash_cols.filter(is_match)
+
             if len(matches) > 0:
-                subset = tb.take(matches)
                 path = macrotile.matched_file_loc(id_field, m, k)
-                macrotile.write_batch_to_filehandle(path, subset)
+                macrotile.write_batch_to_filehandle(path, matches)
 
         # for grandchildren, insert everything below here.
         for child in self.children():
@@ -858,8 +890,6 @@ class Macrotile:
                 child.close_filehandles()
 
     def complete_candidate_insertion(self, id_field, m: int, k: int):
-        print("completing", self.coords)
-
         if self.candidate_file_loc(id_field, m, k).exists():
             if len(self.children()) == 0:
                 # If it has no children, this actually is a match file. So we can rename and exit.
@@ -927,7 +957,6 @@ def bloom_hash(val: bytes, m: int, k: int) -> np.ndarray:
     # md5 hash which is 32 bytes, and then take slices of that offset by one byte
     # at a time to represent the different hash functions. So if there are
     #
-
     # Should this be 4 or 8?
     each_takes = int(m / 4)
     assert (
@@ -1114,8 +1143,6 @@ class Tile:
         for tile in self.iterate(direction="bottom-up"):
             manifest = tile.final_flush()
             n_complete += 1
-        # print(f"{' ' * self.coords[0]} finalized {self.key}")
-
         return manifest  # is now the tile manifest for the root.
 
     def __repr__(self):
