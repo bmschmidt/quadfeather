@@ -342,7 +342,7 @@ def main(
         logger.info("Done with preliminary build")
     else:
         rewritten_files = files
-        if extent is None:
+        if extent is None or extent.x[0] == float("inf"):
             fin = files[0]
             if fin.suffix == ".feather" or fin.suffix == ".parquet":
                 reader = get_ingester(files)
@@ -360,7 +360,6 @@ def main(
                     if y["max"] > ymax and isfinite(y["max"]):
                         ymax = y["max"]
                 extent = Rectangle(x=(xmin, xmax), y=(ymin, ymax))
-
         if files[0].suffix == ".feather":
             first_batch = ipc.RecordBatchFileReader(files[0])
             raw_schema = first_batch.schema
@@ -598,7 +597,8 @@ class Quadtree:
         for tb in data:
             if isinstance(tb, pa.RecordBatch):
                 tb = pa.Table.from_batches([tb])
-            root.insert_for_join(tb, id_field, m, k)
+            root.insert_for_join(tb, id_field, m, k, new_sidecar_name)
+        root.complete_insert_stage(id_field, m, k, new_sidecar_name)
         root.complete_join(id_field, m, k, new_sidecar_name)
 
     @property
@@ -672,7 +672,6 @@ class Macrotile:
         self._open_filehandles: Dict[
             Path, Union[ipc.RecordBatchFileWriter, pq.ParquetWriter]
         ] = {}
-        self._file_handles_needing_closure: Set[Path] = set()
         if parent is None:
             self.parent = None
         else:
@@ -770,23 +769,27 @@ class Macrotile:
         self.bloom_filter_loc(id_field, m, k).parent.mkdir(parents=True, exist_ok=True)
         feather.write_feather(tb, bloom_filter_loc, compression="zstd")
 
-    def matched_file_loc(self, id_field, m, k):
+    def matched_file_loc(self, new_sidecar_name, m, k):
         """
         The location to which we write files that match the bloom filter here.
         """
-        return self.bloom_filter_loc(id_field, m, k).with_suffix(".matches.parquet")
+        return self.bloom_filter_loc(new_sidecar_name, m, k).with_suffix(
+            ".matches.parquet"
+        )
 
-    def candidate_file_loc(self, id_field, m, k):
+    def candidate_file_loc(self, new_sidecar_name, m, k):
         """
         Differs from 'matched_file_loc' because this file applies not just the
         macrotiles filter, but filters for all macrotiles *beneath* it.
         """
-        return self.bloom_filter_loc(id_field, m, k).with_suffix(".candidates.parquet")
+        return self.bloom_filter_loc(new_sidecar_name, m, k).with_suffix(
+            ".candidates.parquet"
+        )
 
     def bloom_filter(self, id_field, m, k):
         loc = self.bloom_filter_loc(id_field, m, k)
         if not loc.exists():
-            logger.info("MAKING BLOOM FILTER", self.coords, id_field, m, k)
+            logger.debug(("MAKING BLOOM FILTER", self.coords, id_field, m, k))
             self.build_bloom_filter(id_field, m, k)
         tb = feather.read_table(loc)
         return pc.list_flatten(tb.take([0])["bitmask"])
@@ -794,11 +797,12 @@ class Macrotile:
     def bloom_filters_below_here(self, id_field, m, k, inclusive=True):
         """
         Returns a single bloom filter which combines together all bloom filters
-        below, NOT including this one.
+        below, including this one.
         """
         if inclusive:
             total_filter = self.bloom_filter(id_field, m, k)
         else:
+            raise NotImplementedError("Not implemented")
             total_filter = pa.array(np.zeros(2**m), pa.bool_())
         children = self.children()
         while len(children) > 0:
@@ -809,7 +813,9 @@ class Macrotile:
             children = [*children, *child.children()]
         return total_filter
 
-    def insert_for_join(self, tb: pa.Table, id_field, m: int, k: int):
+    def insert_for_join(
+        self, tb: pa.Table, id_field, m: int, k: int, new_sidecar_name: str
+    ):
         """
 
         key: the join key.
@@ -840,7 +846,7 @@ class Macrotile:
             hashes[i] = bloom_hash(bytes, m, k)
 
         hash_cols = pa.table({f"hash_{i}": pa.array(hashes[:, i]) for i in range(k)})
-        logger.debug("Inserting for join", self.coords, id_field, len(tb), m, k)
+        # logger.debug(f"Inserting for join {(self.coords, id_field, len(tb), m, k)}")
         for macrotile in [self, *self.children()]:
             key = str(macrotile.bloom_filter_loc(id_field, m, k))
             if not key in self.quadtree._bloom_cache:
@@ -855,7 +861,7 @@ class Macrotile:
                 loc_hash_cols = loc_hash_cols.filter(is_match)
 
             if len(matches) > 0:
-                path = macrotile.matched_file_loc(id_field, m, k)
+                path = macrotile.matched_file_loc(new_sidecar_name, m, k)
                 macrotile.write_batch_to_filehandle(path, matches)
 
         # for grandchildren, insert everything below here.
@@ -871,76 +877,84 @@ class Macrotile:
                     )
 
                 bloom_filter = self.quadtree._bloom_cache[key]
-                matches = []
-                for i, hash in enumerate(hashes):
-                    if pc.all(bloom_filter.take(hash)):
-                        matches.append(i)
+                matches = tb
+                loc_hash_cols = hash_cols
+                for i in range(k):
+                    # Go through the hashes in vectorized order.
+                    is_match = bloom_filter.take(loc_hash_cols[f"hash_{i}"])
+                    matches = matches.filter(is_match)
+                    loc_hash_cols = loc_hash_cols.filter(is_match)
                 if len(matches) > 0:
-                    subset = tb.take(matches)
-                    path = macrotile.candidate_file_loc(id_field, m, k)
-                    macrotile.write_batch_to_filehandle(path, subset)
+                    path = grandchild.candidate_file_loc(new_sidecar_name, m, k)
+                    macrotile.write_batch_to_filehandle(path, matches)
 
     def close_filehandles(self, recursive=True):
+        """
+        Closes any open files below this point in the tree.
+        """
         for path, file in [*self._open_filehandles.items()]:
             file.close()
-            self._file_handles_needing_closure.add(path)
             del self._open_filehandles[path]
         if recursive:
             for child in self.children():
                 child.close_filehandles()
 
-    def complete_candidate_insertion(self, id_field, m: int, k: int):
-        if self.candidate_file_loc(id_field, m, k).exists():
+    def complete_insert_stage(self, id_field, m: int, k: int, new_sidecar_name):
+        self.close_filehandles(recursive=True)
+        if self.candidate_file_loc(new_sidecar_name, m, k).exists():
             if len(self.children()) == 0:
-                # If it has no children, this actually is a match file. So we can rename and exit.
-                self.candidate_file_loc(id_field, m, k).rename(
-                    self.matched_file_loc(id_field, m, k)
+                # This means that we're done inserting, and can rename it
+                # to be a matched file.
+                self.candidate_file_loc(new_sidecar_name, m, k).rename(
+                    self.matched_file_loc(new_sidecar_name, m, k)
                 )
-                return
-            fin = pq.ParquetFile(self.candidate_file_loc(id_field, m, k))
-            for batch in fin.iter_batches():
-                self.insert_for_join(pa.Table.from_batches([batch]), id_field, m, k)
-            self.candidate_file_loc(id_field, m, k).unlink()
-            self.close_filehandles()
-
-        # And recurse.
+            else:
+                for batch in pq.ParquetFile(
+                    self.candidate_file_loc(new_sidecar_name, m, k)
+                ).iter_batches():
+                    b = pa.Table.from_batches([batch])
+                    self.insert_for_join(
+                        b,
+                        id_field,
+                        m,
+                        k,
+                        new_sidecar_name,
+                    )
+                self.candidate_file_loc(new_sidecar_name, m, k).unlink()
         for child in self.children():
-            child.complete_candidate_insertion(id_field, m, k)
+            child.complete_insert_stage(id_field, m, k, new_sidecar_name)
 
     def complete_join(self, id_field, m, k, new_sidecar_name):
-
         # Called once all the record batches of a join have been inserted.
-
-        # It's bad to have lots of filehandles lagging open,
-        # so close everything first.
-        self.close_filehandles(recursive=True)
-
         # Identify where in the original dataset this table comes from
         try:
             sidecar = self.quadtree.sidecars[id_field]
         except KeyError:
             sidecar = None
 
-        # Recursively flush any candidate files holding lots of points.
-        self.complete_candidate_insertion(id_field, m, k)
+        if not self.matched_file_loc(new_sidecar_name, m, k).exists():
+            raise FileNotFoundError(
+                f"Match file does not exist for {self.coords} but should."
+            )
+        for tile in self.tiles():
+            dest = tile.filename.with_suffix(f".{new_sidecar_name}.feather")
+            if dest.exists():
+                raise FileExistsError(f"File {dest} already exists.")
+                # logger.warning(f"File {dest} already exists.")
+                # continue
+            ids = tile.read_column(id_field, sidecar)
+            # Read *only* the relevant parts of the parquet file.
+            matches = pq.read_table(
+                self.matched_file_loc(new_sidecar_name, m, k),
+                filters=[(id_field, "in", ids)],
+            )
+            sort_indices = pc.index_in(ids, matches[id_field])
 
-        if self.matched_file_loc(id_field, m, k) in self._file_handles_needing_closure:
-            for tile in self.tiles():
-                ids = tile.read_column(id_field, sidecar)
-                # Read *only* the relevant parts of the parquet file.
-                matches = pq.read_table(
-                    self.matched_file_loc(id_field, m, k),
-                    filters=[(id_field, "in", ids)],
-                )
-                sort_indices = pc.index_in(ids, matches[id_field])
-
-                dest = tile.filename.with_suffix(f".{new_sidecar_name}.feather")
-                feather.write_feather(
-                    matches.take(sort_indices).drop([id_field]),
-                    dest,
-                    compression="uncompressed",
-                )
-
+            feather.write_feather(
+                matches.take(sort_indices).drop([id_field]),
+                dest,
+                compression="uncompressed",
+            )
         for mychild in self.children():
             mychild.complete_join(id_field, m, k, new_sidecar_name)
 
@@ -1015,7 +1029,6 @@ class Tile:
         """
         self.ix_extent: Tuple[int, int] = (-1, -2)  # Initalize with bad values
         self.coords = tile_code
-        logger.debug(f"{' ' * self.coords[0]} creating {self.coords}")
         self.quadtree = quadtree
         if isinstance(extent, tuple):
             extent = Rectangle(x=extent[0], y=extent[1])
@@ -1102,7 +1115,6 @@ class Tile:
         """
         Completes the quadtree so that no more points can be added.
         """
-        # print(f"{' ' * self.coords[0]} finalizing {self.key}")
         logger.debug(f"first flush of {self.coords} complete")
         for tile in self.iterate(direction="top-down"):
             # First, we close any existing overflow buffers.
@@ -1129,7 +1141,7 @@ class Tile:
                                 root = root.append_column(col, batch[col])
                         yield root.combine_chunks().to_batches()[0]
 
-                # Insert in chunks of 100M
+                # Insert in chunks of 100 megabytes
                 for batch in rebatch(yielder(), 100e6):
                     tile.insert(batch)
                 tile.overflow_loc.unlink()
@@ -1318,7 +1330,7 @@ class Tile:
         raise ValueError("Children have not been created.")
 
     def make_children(self, weights: List[float]):
-        logger.warning(
+        logger.debug(
             f"{' ' * self.coords[0]} Making children with budget of {self.permitted_children} for {self.key}, weights of {weights}"
         )
         # QUAD ONLY
@@ -1383,8 +1395,8 @@ class Tile:
             self.schema = table.schema
             return
         if not self.schema.equals(table.schema):
-            logger.error("INSERTING:", table.schema)
-            logger.error("OWN SCHEMA", self.schema)
+            logger.debug("INSERTING:", table.schema)
+            logger.debug("OWN SCHEMA", self.schema)
             raise TypeError("Attempted to insert a table with a different schema.")
 
     def insert_table(self, table: pa.Table):

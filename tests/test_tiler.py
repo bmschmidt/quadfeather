@@ -150,7 +150,7 @@ class TestCSV:
         t2 = qtree.read_root_table("cat")
         assert t2.num_rows == 1000
         assert "cat" in t2.column_names
-        assert pa.types.is_dictionary(t2.schema.field_by_name("cat").type)
+        assert pa.types.is_dictionary(t2.schema.field("cat").type)
 
     def test_small_block_overflow(self, tmp_path):
         """
@@ -304,21 +304,27 @@ class TestAppends:
 
         assert (pc.all(pc.equal(m["join_field"], root_ids))).as_py()
 
-    def test_join(self, tmp_path, NUM_POINTS=100_000, TILE_SIZE=1000):
+    def test_large_join(self, tmp_path, NUM_POINTS=50_000, TILE_SIZE=300):
         """
         This is a scale test, so num_points can be passed something arbitrarily large if we
         want to make sure it works up to 100M points or whatever.
+
+
+        50_000 / 300 seems to be sufficient to force writing to a fifth tile depth, which is
+        one point where I've seen breakages.
         """
         insert_data = pa.table(
             {
                 "id": pa.array(np.arange(NUM_POINTS)).cast(pa.string()),
-                "x": np.random.random(NUM_POINTS),
-                "y": np.random.random(NUM_POINTS),
+                "x": np.random.normal(0, 10, NUM_POINTS),
+                "y": np.random.normal(0, 10, NUM_POINTS),
             }
         )
+        xtent = pc.min_max(insert_data["x"]).as_py()
+        ytent = pc.min_max(insert_data["y"]).as_py()
         qtree = Quadtree(
             mode="write",
-            extent=((0, 1), (0, 1)),
+            extent=((xtent["min"], xtent["max"]), (ytent["min"], ytent["max"])),
             max_open_filehandles=33,
             basedir=tmp_path / "tiles",
             tile_size=TILE_SIZE,
@@ -338,8 +344,8 @@ class TestAppends:
         def stream():
             start = 0
             while start < len(insert_tb):
-                yield insert_tb.take(np.arange(start, start + int(NUM_POINTS / 1000)))
-                start += int(NUM_POINTS / 1000)
+                yield insert_tb.take(np.arange(start, start + int(NUM_POINTS / 100)))
+                start += int(NUM_POINTS / 100)
 
         qtree.join(stream(), "id", "new_sidecar")
 
@@ -358,11 +364,19 @@ class TestAppends:
                 root_ids = t.read_column("id", None)
             except FileNotFoundError:
                 continue
-            joined_table = feather.read_table(
-                t.filename.with_suffix(".new_sidecar.feather")
-            )["join_field"]
+            try:
+                joined_table = feather.read_table(
+                    t.filename.with_suffix(".new_sidecar.feather")
+                )["join_field"]
+            except FileNotFoundError:
+                logger.warning(f"FILE {t.coords} LOST")
+                continue
             # Is this individual tile correct?
-            assert (pc.all(pc.equal(joined_table, root_ids))).as_py()
+            try:
+                assert (pc.all(pc.equal(joined_table, root_ids))).as_py()
+            except AssertionError:
+                logger.error(f"Failed on tile {t.coords}")
+                raise
             matched += len(joined_table)
         # Did we find a match for every point?
         assert matched == NUM_POINTS
@@ -376,6 +390,11 @@ if __name__ == "__main__":
     # t = TestStreaming()
     # t.test_streaming_batches(tmp_path=Path("tmp"))
     t = TestAppends()
-    t.test_join(
-        tmp_path=Path("tmp"), NUM_POINTS=int(sys.argv[1]), TILE_SIZE=int(sys.argv[2])
-    )
+    try:
+        t.test_large_join(
+            tmp_path=Path("tmp"),
+            NUM_POINTS=int(sys.argv[1]),
+            TILE_SIZE=int(sys.argv[2]),
+        )
+    except IndexError:
+        t.test_large_join(tmp_path=Path("tmp"))
