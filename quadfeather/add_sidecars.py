@@ -43,7 +43,7 @@ def add_sidecars_cli():
     args = parse_args()
     tileset = Quadtree.from_dir(args.tileset, mode="append")
 
-    ingester = get_ingester(args.sidecar, args.sidecar_name)
+    ingester = get_ingester(args.sidecar, False)
 
     tileset.join(
         data=ingester.batches(), id_field=args.key, new_sidecar_name=args.sidecar_name

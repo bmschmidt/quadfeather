@@ -310,8 +310,9 @@ class TestAppends:
         want to make sure it works up to 100M points or whatever.
 
 
-        50_000 / 300 seems to be sufficient to force writing to a fifth tile depth, which is
-        one point where I've seen breakages.
+        50_000 / 300 with a normal distribution seems to be sufficient to force writing to a fifth tile depth,
+        which is the necessary point for testing recursion down to the second set
+        of macrotile insertion.
         """
         insert_data = pa.table(
             {

@@ -3,7 +3,6 @@ from pyarrow import csv, feather, parquet as pq, compute as pc, ipc as ipc
 
 # import pandas as pd
 import logging
-import functools
 from pathlib import Path
 import sys
 import argparse
@@ -14,12 +13,10 @@ from base64 import urlsafe_b64encode
 from numpy import random as nprandom
 from collections import defaultdict, Counter
 from typing import (
-    DefaultDict,
     Iterator,
     Dict,
     List,
     Tuple,
-    Set,
     Optional,
     Any,
     Literal,
@@ -658,13 +655,21 @@ class Quadtree:
 
 
 class Macrotile:
+    """
+    This is an experimental class for operations that are batched across multiple tiles.
+
+    Currently it's only used for bloom filters. A macrotile consists of 21 tiles; a root,
+    its four children, and its sixteen grandchildren. each of the grandchildren is the
+    root of its *own* macrotile.
+    """
+
     def __init__(
         self,
         quadtree: Quadtree,
         coords: Tuple[int, int, int],
         tiles: Optional[List["Tile"]] = None,
-        parent=None,
     ):
+        # gut check -- macrotiles can never be 1/0/0, 3/1/3, etc.
         assert coords[0] % 2 == 0
         self.quadtree = quadtree
         self.coords = coords
@@ -672,10 +677,6 @@ class Macrotile:
         self._open_filehandles: Dict[
             Path, Union[ipc.RecordBatchFileWriter, pq.ParquetWriter]
         ] = {}
-        if parent is None:
-            self.parent = None
-        else:
-            self.parent = parent
 
     def write_batch_to_filehandle(self, path: Path, batch: pa.Table):
         if not path in self._open_filehandles:
@@ -710,6 +711,9 @@ class Macrotile:
                 yield tile
 
     def bloom_filter_loc(self, id_field: str, m: int, k: int):
+        """
+        The location for a bloom filter about field 'id_field' with log2(m) bits and k hashes.
+        """
         (z, x, y) = self.coords
         # Make sure the id_field is filename safe
         id_field_enc = urlsafe_b64encode(id_field.encode("utf-8")).decode("utf-8")
@@ -742,6 +746,10 @@ class Macrotile:
             # Integers are hashed as strings. Not ideal.
             if not pa.types.is_string(col.type):
                 col = col.cast(pa.string())
+
+            # TODO: This could probably be vectorized to work more
+            # more efficiently; rather than set the bits one row at a time,
+            # build of the list of all positions and set them at once.
 
             for item in col:
                 # Retrieve the bytes of the string.
@@ -818,6 +826,8 @@ class Macrotile:
     ):
         """
 
+        The first step in a join. This can be done any number of times.
+
         key: the join key.
 
         """
@@ -891,6 +901,8 @@ class Macrotile:
     def close_filehandles(self, recursive=True):
         """
         Closes any open files below this point in the tree.
+
+        Called in complete_insert_stage.
         """
         for path, file in [*self._open_filehandles.items()]:
             file.close()
@@ -900,15 +912,27 @@ class Macrotile:
                 child.close_filehandles()
 
     def complete_insert_stage(self, id_field, m: int, k: int, new_sidecar_name):
+        """
+        The second step in a join. Finalizes the insertion recursively below, and
+        closes any remaining resources.
+        """
         self.close_filehandles(recursive=True)
+        # Close the lagging bloom filters
+        self.quadtree._bloom_cache = {}
+
         if self.candidate_file_loc(new_sidecar_name, m, k).exists():
+            # "Candidate file loc" means that we encountered a bloom filter match
+            # including all of the children of this tile.
             if len(self.children()) == 0:
-                # This means that we're done inserting, and can rename it
-                # to be a matched file.
+                # If we have preliminary unmerged files but no children,
+                # this means that we're done inserting, and can rename it
+                # to be a 'matched' file.
                 self.candidate_file_loc(new_sidecar_name, m, k).rename(
                     self.matched_file_loc(new_sidecar_name, m, k)
                 )
             else:
+                # Otherwise, we need to recursively insert that file
+                # at an appropriate point in the tree.
                 for batch in pq.ParquetFile(
                     self.candidate_file_loc(new_sidecar_name, m, k)
                 ).iter_batches():
@@ -920,41 +944,70 @@ class Macrotile:
                         k,
                         new_sidecar_name,
                     )
+                # Clean up the candidate file, because it has now been inserted below here.
                 self.candidate_file_loc(new_sidecar_name, m, k).unlink()
+                # Close the filehandles for the children immediately to avoid
+                # lagging writers
+                self.close_filehandles()
+                self.quadtree._bloom_cache = {}
         for child in self.children():
+            # Finally, we need to recursively complete the insert stage for all children.
+            # This ensure that there all candidate files have been flushed to the farthest leaves
+            # of the quadtree, that all files are closed and that there are no lingering
+            # resources.
             child.complete_insert_stage(id_field, m, k, new_sidecar_name)
+        # I don't *think* this is necessary, but one last check to make sure that
+        # all the filehandles are closed.
+        self.close_filehandles()
+        self.quadtree._bloom_cache = {}
 
     def complete_join(self, id_field, m, k, new_sidecar_name):
-        # Called once all the record batches of a join have been inserted.
-        # Identify where in the original dataset this table comes from
+        """
+        The third and final stage in a join.
+        Called once all the record batches of a join have been inserted.
+        Now that we have parquet files identifying for each macrotile of 21 tiles
+        a set of candidate matches, we can now read those files and write out
+        the final sidecar files in exactly the same order as the original files.
+        """
         try:
             sidecar = self.quadtree.sidecars[id_field]
         except KeyError:
             sidecar = None
 
         if not self.matched_file_loc(new_sidecar_name, m, k).exists():
-            raise FileNotFoundError(
-                f"Match file does not exist for {self.coords} but should."
-            )
-        for tile in self.tiles():
-            dest = tile.filename.with_suffix(f".{new_sidecar_name}.feather")
-            if dest.exists():
-                raise FileExistsError(f"File {dest} already exists.")
-                # logger.warning(f"File {dest} already exists.")
-                # continue
-            ids = tile.read_column(id_field, sidecar)
-            # Read *only* the relevant parts of the parquet file.
-            matches = pq.read_table(
-                self.matched_file_loc(new_sidecar_name, m, k),
-                filters=[(id_field, "in", ids)],
-            )
-            sort_indices = pc.index_in(ids, matches[id_field])
+            # Can happen if there are no matches.
+            pass
+        
+        else:
+            for tile in self.tiles():
+                dest = tile.filename.with_suffix(f".{new_sidecar_name}.feather")
+                if dest.exists():
+                    raise FileExistsError(f"File {dest} already exists.")
+                    # logger.warning(f"File {dest} already exists.")
+                    # continue
+                ids = tile.read_column(id_field, sidecar)
+                # Read *only* the relevant rows of the parquet file.
+                # So long as the
+                matches = pq.read_table(
+                    self.matched_file_loc(new_sidecar_name, m, k),
+                    filters=[(id_field, "in", ids)],
+                )
+                sort_indices = pc.index_in(ids, matches[id_field])
 
-            feather.write_feather(
-                matches.take(sort_indices).drop([id_field]),
-                dest,
-                compression="uncompressed",
-            )
+                # Now we reshuffle the matches to be in the same order as the original file.
+
+                towrite = matches.drop([id_field]).take(sort_indices)
+                try:
+                    # Sidecars should generally be a single record batch, but if they
+                    # contain more than 2GB of text this may break.
+                    towrite = towrite.combine_chunks()
+                except pa.lib.ArrowInvalid:
+                    logger.warning(f"Failed to combine chunks for {tile.coords}")
+                feather.write_feather(
+                    towrite,
+                    dest,
+                    compression="uncompressed",
+                )
         for mychild in self.children():
             mychild.complete_join(id_field, m, k, new_sidecar_name)
 

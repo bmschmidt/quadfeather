@@ -45,24 +45,33 @@ def rbatch(
 
     for c, xparam, yparam in classes:
         x = f(*xparam, size=SIZE // 4) * 1.5
+        x2 = f(*xparam, size=SIZE // 4) * 1.5
         while len(x) < SIZE // 4:
             x = np.concatenate([x, f(*xparam, size=SIZE // 4)])
+            x2 =  np.concatenate([x2, f(*xparam, size=SIZE // 4)])
         x = x[: SIZE // 4]
+        x2 = x2[: SIZE // 4]
         y = f(*yparam, size=SIZE // 4)
+        y2 = f(*yparam, size=SIZE // 4)
         while len(y) < SIZE // 4:
             y = np.concatenate([y, f(*yparam, size=SIZE // 4)])
-        y = y[: SIZE // 4]
+            y2 = np.concatenate([y2, f(*yparam, size=SIZE // 4)])
+        y2 = y2[: SIZE // 4]
 
         date = random.choice(dates, size=len(x), replace=True)
+        
+        position = pa.StructArray.from_arrays([x2, y2], ['x', 'y'])
         frame = pa.table(
             {
                 "x": x,
                 "y": y,
+                "position": position,
                 "class": [c] * len(x),
                 "quantity": random.random(len(x)),
                 "date": date,
             }
         )
+
         frames.append(frame)
     return pa.concat_tables(frames)
 
