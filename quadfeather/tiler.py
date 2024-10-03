@@ -153,30 +153,14 @@ def refine_schema(schema: pa.Schema) -> Dict[str, pa.DataType]:
     fields = {}
     seen_ix = False
     for el in schema:
-        if isinstance(el.type, pa.DictionaryType) and pa.types.is_string(
-            el.type.value_type
-        ):
-            t = pa.dictionary(pa.int16(), pa.utf8())
-            fields[el.name] = t
-        #            el = pa.field(el.name, t)
-        elif pa.types.is_float64(el.type) or pa.types.is_float32(el.type):
-            fields[el.name] = pa.float32()
-        elif el.name == "ix":
+        if el.name == "ix":
             fields[el.name] = pa.uint64()
             seen_ix = True
-        elif pa.types.is_integer(el.type):
-            # Integers become float32
-            fields[el.name] = pa.float32()
-        elif pa.types.is_large_string(el.type) or pa.types.is_string(el.type):
-            fields[el.name] = pa.string()
-        elif pa.types.is_boolean(el.type):
-            fields[el.name] = pa.float32()
-        elif pa.types.is_date32(el.type):
-            fields[el.name] = pa.date32()
-        elif pa.types.is_temporal(el.type):
+        elif pa.types.is_date(el.type):
+            # Deepscatter can't handle all the different date types.
             fields[el.name] = pa.timestamp("ms")
         else:
-            raise TypeError(f"Unsupported type {el.type}")
+            fields[el.name] = el.type
     if not seen_ix:
         fields["ix"] = pa.uint64()
     return fields
@@ -197,16 +181,6 @@ def determine_schema(files: List[Path]):
     schema = {}
     for el in raw_schema:
         t = el.type
-        if t == pa.uint64() and el.name != "ix":
-            t = pa.float32()
-        if t == pa.int32() and el.name != "ix":
-            t = pa.float32()
-        if t == pa.float64():
-            t = pa.float32()
-        if t == pa.large_string():
-            t = pa.string()
-        if isinstance(t, pa.DictionaryType) and pa.types.is_string(t.value_type):
-            t = pa.dictionary(pa.int16(), pa.utf8())
         schema[el.name] = t
         if el.name in override:
             schema[el.name] = getattr(pa, override[el.name])()
@@ -737,7 +711,7 @@ class Macrotile:
 
         # At *read* time, we are carefuly to use bitmasks.
 
-        positions = np.zeros((2**m), np.bool8)
+        positions = np.zeros((2**m), np.bool)
         tilenames = []
         id_sidecar = self.quadtree.sidecars.get(id_field, None)
 
