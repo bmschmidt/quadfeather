@@ -1,20 +1,32 @@
 import pyarrow as pa
 from pyarrow import parquet as pq, feather, json as pajson, csv, ipc
 from pathlib import Path
-from typing import DefaultDict, Dict, List, Tuple, Set, Optional, Iterable, Callable
+from typing import (
+    DefaultDict,
+    Dict,
+    Union,
+    List,
+    Tuple,
+    Set,
+    Optional,
+    Iterable,
+    Callable,
+)
 from abc import ABC, abstractmethod
 
 
 class Ingester(ABC):
     def __init__(
         self,
-        files: List[Path] = [],
+        files: Union[Path, List[Path]] = [],
         batch_size: int = 1024 * 1024 * 1024,
         columns: Optional[List[str]] = None,
         destructive: bool = False,
     ):
         # Allow iteration over a st
         # queue_size: maximum bytes in an insert chunk.
+        if not isinstance(files, list):
+            files = [files]
         self.files = files
         self.queue = []
         self.columns = columns
@@ -51,6 +63,17 @@ class BatchIngester(Ingester):
 
     def batches(self):
         yield from self.batch_caller()
+
+
+class CSVIngester(Ingester):
+    def batches(self) -> Iterable[pa.RecordBatch]:
+        for file in self.files:
+            with open(file, "rb") as fin:
+                reader = csv.open_csv(fin, read_options=csv.ReadOptions())
+                for batch in reader:
+                    yield batch
+            if self.destructive:
+                file.unlink()
 
 
 class ArrowIngester(Ingester):
@@ -97,11 +120,17 @@ class ParquetIngester(Ingester):
 
 
 def get_ingester(
-    files: List[Path], destructive=False, columns: Optional[List[str]] = None
+    files: Union[Path, List[Path]],
+    destructive=False,
+    columns: Optional[List[str]] = None,
 ) -> Ingester:
+    if not isinstance(files, list):
+        files = [files]
     assert (
         len(set([f.suffix for f in files])) == 1
     ), "All files must be of the same type"
+    if files[0].suffix == ".csv":
+        return CSVIngester(files, destructive=destructive, columns=columns)
     if files[0].suffix == ".parquet":
         return ParquetIngester(files, destructive=destructive, columns=columns)
     elif files[0].suffix == ".feather":
