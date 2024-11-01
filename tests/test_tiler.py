@@ -86,12 +86,14 @@ class TestCSV:
             fout.write(f"x,y,number,cat\n")
             # Write 10,000 of each category to see if the later ones throw a dictionary error.
             rows = []
-            for key, count in [
-                ("apple", 10_000),
-                ("banana", 1_000),
-                ("strawberry", 100),
-                ("mulberry", 10),
-            ]:
+            desired_counts = {
+                "apple": 10_000,
+                "banana": 1_000,
+                "strawberry": 100,
+                "mulberry": 10,
+            }
+
+            for key, count in desired_counts.items():
                 for _ in range(count):
                     rows.append(
                         f"{random.random()},{random.random()},{random.randint(0, 100)},{key}\n"
@@ -115,7 +117,13 @@ class TestCSV:
             batches.append(feather.read_table(fin))
 
         alltogether = pa.concat_tables(batches)
-        counts = alltogether["cat"].value_counts().to_pydict()
+
+        # Ensure that the sidecars contain the correct number of
+        # values for the categories we inserted
+        counts = alltogether["cat"].value_counts().to_pylist()
+        assert len(counts) == len(desired_counts)
+        for row in counts:
+            assert desired_counts[row["values"]] == row["counts"]
 
     def test_if_break_categorical_chunks(self, tmp_path):
         input = tmp_path / "test.csv"
@@ -142,7 +150,7 @@ class TestCSV:
         t2 = qtree.read_root_table("cat")
         assert t2.num_rows == 1000
         assert "cat" in t2.column_names
-        assert pa.types.is_dictionary(t2.schema.field_by_name("cat").type)
+        assert pa.types.is_dictionary(t2.schema.field("cat").type)
 
     def test_small_block_overflow(self, tmp_path):
         """
@@ -172,13 +180,13 @@ class TestParquet:
     def test_big_parquet(self, tmp_path):
         size = 5_000_000
         demo_parquet(tmp_path / "test.parquet", size=size)
-        main(
+        qtree = main(
             files=[tmp_path / "test.parquet"],
             destination=tmp_path / "tiles",
             tile_size=5000,
             first_tile_size=1000,
         )
-        manifest = feather.read_table(tmp_path / "tiles" / "manifest.feather")
+        manifest = qtree.manifest_table
         assert pc.sum(manifest["nPoints"]).as_py() == size
         tb = feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
         ps = tb["ix"].to_pylist()
@@ -218,8 +226,176 @@ class TestStreaming:
         tb = feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
 
 
+class TestAppends:
+    """
+    Tests operations related to joins onto existing files.
+    """
+
+    def test_build_index(self, tmp_path):
+        """
+        Test the building of a bloom-filter based index.
+        """
+        insert_data = pa.table(
+            {
+                "id": pa.array(np.arange(10_000)).cast(pa.string()),
+                "x": np.random.random(10_000),
+                "y": np.random.random(10_000),
+            }
+        )
+        qtree = Quadtree(
+            mode="write",
+            extent=((0, 1), (0, 1)),
+            max_open_filehandles=33,
+            basedir=tmp_path / "tiles",
+            first_tile_size=50,
+            tile_size=100,
+        )
+
+        qtree.insert(insert_data)
+
+        qtree.finalize()
+
+        reloaded = Quadtree.from_dir(tmp_path / "tiles", mode="append")
+
+        reloaded.build_bloom_index("id", None)
+
+    def test_join_onefile(self, tmp_path):
+        """
+        A shorter join test with just one file.
+        """
+        insert_data = pa.table(
+            {
+                "id": pa.array(np.arange(10_000)).cast(pa.string()),
+                "x": np.random.random(10_000),
+                "y": np.random.random(10_000),
+            }
+        )
+        qtree = Quadtree(
+            mode="write",
+            extent=((0, 1), (0, 1)),
+            max_open_filehandles=33,
+            basedir=tmp_path / "tiles",
+            tile_size=65_000,
+            first_tile_size=65_000,
+        )
+
+        qtree.insert(insert_data)
+
+        qtree.finalize()
+
+        ids = pa.array(np.arange(1_000_000)).cast(pa.string())
+        insert_tb = pa.table({"id": ids, "join_field": ids})
+        # Shuffle the insert table.
+        shuffled_indices = np.random.permutation(len(insert_tb))
+        insert_tb = insert_tb.take(pa.array(shuffled_indices))
+
+        # Construct an iterator to feed into the join function.
+        def stream():
+            start = 0
+            while start < len(insert_tb):
+                yield insert_tb.take(np.arange(start, start + 1000))
+                start += 1000
+
+        qtree.join(stream(), "id", "new_sidecar")
+        m = qtree.read_root_table("new_sidecar")
+        root_ids = qtree.read_root_table(None)["id"]
+        assert not "id" in m.column_names
+        assert "join_field" in m.column_names
+
+        assert (pc.all(pc.equal(m["join_field"], root_ids))).as_py()
+
+    def test_large_join(self, tmp_path, NUM_POINTS=50_000, TILE_SIZE=300):
+        """
+        This is a scale test, so num_points can be passed something arbitrarily large if we
+        want to make sure it works up to 100M points or whatever.
+
+
+        50_000 / 300 with a normal distribution seems to be sufficient to force writing to a fifth tile depth,
+        which is the necessary point for testing recursion down to the second set
+        of macrotile insertion.
+        """
+        insert_data = pa.table(
+            {
+                "id": pa.array(np.arange(NUM_POINTS)).cast(pa.string()),
+                "x": np.random.normal(0, 10, NUM_POINTS),
+                "y": np.random.normal(0, 10, NUM_POINTS),
+            }
+        )
+        xtent = pc.min_max(insert_data["x"]).as_py()
+        ytent = pc.min_max(insert_data["y"]).as_py()
+        qtree = Quadtree(
+            mode="write",
+            extent=((xtent["min"], xtent["max"]), (ytent["min"], ytent["max"])),
+            max_open_filehandles=33,
+            basedir=tmp_path / "tiles",
+            tile_size=TILE_SIZE,
+            first_tile_size=int(TILE_SIZE / 4),
+        )
+
+        qtree.insert(insert_data)
+
+        qtree.finalize()
+
+        ids = pa.array(np.arange(NUM_POINTS)).cast(pa.string())
+        insert_tb = pa.table({"id": ids, "join_field": ids})
+        # Shuffle the insert table.
+        shuffled_indices = np.random.permutation(len(insert_tb))
+        insert_tb = insert_tb.take(pa.array(shuffled_indices))
+
+        def stream():
+            start = 0
+            while start < len(insert_tb):
+                yield insert_tb.take(np.arange(start, start + int(NUM_POINTS / 100)))
+                start += int(NUM_POINTS / 100)
+
+        qtree.join(stream(), "id", "new_sidecar")
+
+        ### First, we just confirm that the root table was correctly built.
+        m = qtree.read_root_table("new_sidecar")
+        root_ids = qtree.read_root_table(None)["id"]
+        assert not "id" in m.column_names
+        assert "join_field" in m.column_names
+        assert (pc.all(pc.equal(m["join_field"], root_ids))).as_py()
+
+        # Then go through all the files.
+        matched = 0
+        for t in qtree.tiles():
+            try:
+                # Most but not all files have a tile with an id column
+                root_ids = t.read_column("id", None)
+            except FileNotFoundError:
+                continue
+            try:
+                joined_table = feather.read_table(
+                    t.filename.with_suffix(".new_sidecar.feather")
+                )["join_field"]
+            except FileNotFoundError:
+                logger.warning(f"FILE {t.coords} LOST")
+                continue
+            # Is this individual tile correct?
+            try:
+                assert (pc.all(pc.equal(joined_table, root_ids))).as_py()
+            except AssertionError:
+                logger.error(f"Failed on tile {t.coords}")
+                raise
+            matched += len(joined_table)
+        # Did we find a match for every point?
+        assert matched == NUM_POINTS
+
+
 if __name__ == "__main__":
+    import sys
+
     logger = logging.getLogger("quadfeather")
     logger.setLevel(level=logging.DEBUG)
-    t = TestStreaming()
-    t.test_streaming_batches(tmp_path=Path("tmp"))
+    # t = TestStreaming()
+    # t.test_streaming_batches(tmp_path=Path("tmp"))
+    t = TestAppends()
+    try:
+        t.test_large_join(
+            tmp_path=Path("tmp"),
+            NUM_POINTS=int(sys.argv[1]),
+            TILE_SIZE=int(sys.argv[2]),
+        )
+    except IndexError:
+        t.test_large_join(tmp_path=Path("tmp"))

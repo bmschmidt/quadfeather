@@ -6,16 +6,17 @@ import logging
 from pathlib import Path
 import sys
 import argparse
+from io import BytesIO
 import json
+import hashlib
+from base64 import urlsafe_b64encode
 from numpy import random as nprandom
 from collections import defaultdict, Counter
 from typing import (
-    DefaultDict,
     Iterator,
     Dict,
     List,
     Tuple,
-    Set,
     Optional,
     Any,
     Literal,
@@ -26,9 +27,7 @@ import numpy as np
 import sys
 from math import isfinite, sqrt
 from .ingester import get_ingester
-from dataclasses import dataclass, field
-
-import tempfile
+from dataclasses import dataclass
 
 logger = logging.getLogger("quadfeather")
 logger.setLevel(logging.DEBUG)
@@ -36,7 +35,7 @@ DEFAULTS: Dict[str, Any] = {
     "first_tile_size": 1000,
     "tile_size": 50000,
     "destination": Path("."),
-    "max_files": 25.0,
+    "max_open_filehandles": 33.0,
     "randomize": 0.0,
     "files": None,
     "limits": [float("inf"), float("inf"), -float("inf"), -float("inf")],
@@ -109,9 +108,9 @@ def parse_args():
         help="Destination directory to write to.",
     )
     parser.add_argument(
-        "--max_files",
+        "--max-open-filehandles",
         type=float,
-        default=DEFAULTS["max_files"],
+        default=DEFAULTS["max_open_filehandles"],
         help="Max files to have open at once. Default 25. "
         "Usually it's much faster to have significantly fewer files than the max allowed open by the system ",
     )
@@ -143,7 +142,6 @@ def parse_args():
     parser.add_argument("--log-level", type=int, default=30)
     arguments = sys.argv[1:]
     args = parser.parse_args(arguments)
-    # logger.setLevel(args.log_level)
 
     return {**DEFAULTS, **vars(args)}
 
@@ -309,6 +307,8 @@ def main(
     # Actually dict of pa type constructors.
     schema: pa.Schema = pa.schema({}),
     max_open_filehandles=33,
+    randomize=0,
+    limits=None,
 ):
     """
     Run a tiler
@@ -316,7 +316,11 @@ def main(
     arguments: a list of strings to parse. If None, treat as command line args.
     csv_block_size: the block size to use when reading the csv files. The default should be fine,
         but included here to allow for testing multiple blocks.
+
     """
+
+    if extent is None and limits is not None:
+        extent = Rectangle(x=(limits[0], limits[2]), y=(limits[1], limits[3]))
 
     files = [Path(file) for file in files]
     destination = Path(destination)
@@ -335,7 +339,7 @@ def main(
         logger.info("Done with preliminary build")
     else:
         rewritten_files = files
-        if extent is None:
+        if extent is None or extent.x[0] == float("inf"):
             fin = files[0]
             if fin.suffix == ".feather" or fin.suffix == ".parquet":
                 reader = get_ingester(files)
@@ -353,7 +357,6 @@ def main(
                     if y["max"] > ymax and isfinite(y["max"]):
                         ymax = y["max"]
                 extent = Rectangle(x=(xmin, xmax), y=(ymin, ymax))
-
         if files[0].suffix == ".feather":
             first_batch = ipc.RecordBatchFileReader(files[0])
             raw_schema = first_batch.schema
@@ -388,6 +391,7 @@ def main(
         sidecars=sidecars,
         max_open_filehandles=max_open_filehandles,
         dictionaries=dictionaries,
+        randomize=randomize,
     )
     tiler.insert_files(files=rewritten_files)
 
@@ -408,13 +412,14 @@ class Quadtree:
         self,
         basedir: Path,
         extent: Union[Rectangle, Tuple[Tuple[float, float], Tuple[float, float]]],
-        mode: Union[Literal["write"], Literal["read"], Literal["append"]] = "read",
+        mode: Literal["read", "write", "append"] = "read",
         dictionaries: Dict[str, pa.Array] = {},
         schema: pa.Schema = pa.schema({}),
         first_tile_size=2000,
         tile_size=65_000,
         max_open_filehandles=32,
         sidecars: Dict[str, str] = {},
+        randomize=0,
     ):
         """
         * sidecars: a dictionary of sidecar files to add to the tileset. The key is the column that
@@ -427,11 +432,11 @@ class Quadtree:
         self.dictionaries = dictionaries
         self.max_open_filehandles = max_open_filehandles
         self.mode = mode
-        if mode != "write":
-            raise NotImplementedError("Only write mode is supported right now.")
+        self.randomize = randomize
+        # if mode != "write":
+        #     raise NotImplementedError("Only write mode is supported right now.")
         self.sidecars = sidecars
         self._insert_schema = None
-
         if isinstance(extent, tuple):
             extent = Rectangle(x=extent[0], y=extent[1])
         self.schema = schema
@@ -440,10 +445,52 @@ class Quadtree:
             self.root = Tile(
                 quadtree=self,
                 extent=extent,
-                basedir=basedir,
                 permitted_children=max_open_filehandles - 1,
                 tile_code=(0, 0, 0),
             )
+        self._tiles = None
+        self._macrotiles: Optional[List[Macrotile]] = None
+        self._bloom_cache: Dict[str, pa.Array] = {}
+
+    @staticmethod
+    def from_dir(basedir: Path, mode: Literal["read", "append"]) -> "Quadtree":
+        # Load a quadtree from disk.
+        manifest = basedir / "manifest.feather"
+        if not manifest.exists():
+            raise FileNotFoundError(
+                "Not able to load a quadtree without a manifest file."
+            )
+        manifest = feather.read_table(basedir / "manifest.feather")
+        sidecars = json.loads(manifest.schema.metadata[b"sidecars"])
+        schema = pa.ipc.read_schema(BytesIO(bytes(manifest.schema.metadata[b"schema"])))
+        extent = manifest.filter(pc.equal(manifest["key"], "0/0/0"))["extent"][
+            0
+        ].as_py()
+        loaded = json.loads(extent)
+        extent = Rectangle(
+            x=tuple(loaded["x"]),
+            y=tuple(loaded["y"]),
+        )
+        return Quadtree(
+            basedir=basedir,
+            extent=extent,
+            mode=mode,
+            sidecars=sidecars,
+            schema=schema,
+        )
+
+    def tiles(self):
+        if self._tiles is not None:
+            return self._tiles
+        self._tiles = [*self.iterate()]
+        return self._tiles
+
+    @property
+    def macrotiles(self):
+        if self._macrotiles is not None:
+            return self._macrotiles
+        self._macrotiles = [*self.iter_macrotiles()]
+        return self._macrotiles
 
     @property
     def schemas(self) -> Dict[str, pa.Schema]:
@@ -492,13 +539,12 @@ class Quadtree:
             fields = [*fields, *sidecar]
         return pa.schema(fields)
 
-    def read_root_table(self, suffix: str = ""):
+    def read_root_table(self, suffix: Optional[str] = ""):
         path = self.basedir / "0/0/0"
-        if suffix != "":
+        if suffix != "" and suffix is not None:
             path = path.with_suffix(f".{suffix}.feather")
         else:
             path = path.with_suffix(".feather")
-
         return feather.read_table(path)
 
     def finalize(self):
@@ -519,6 +565,497 @@ class Quadtree:
     def manifest_table(self):
         return feather.read_table(self.basedir / "manifest.feather")
 
+    def build_bloom_index(self, id_field: str, id_sidecar: Optional[str], m=28, k=10):
+        """
+        Creates an index of bloom filters.
+        """
+        # 24 and 11 are made up defaults here. I chose them
+        # because I was on a plane and gpt4all suggested 20, 7.
+
+        # Make id_field safe for filenames
+        for macrotile in self.macrotiles:
+            macrotile.build_bloom_filter(id_field, m, k)
+
+    def join(
+        self,
+        data: Iterator[pa.Table],
+        id_field: str,
+        new_sidecar_name: str,
+        m=24,
+        k=2,
+    ):
+        """
+        Given an iterator of data with a keyed field 'key' already present,
+        creates matched sidecars.
+        """
+        root = self.root_macrotile
+        if root is None:
+            raise ValueError("No root macrotile found.")
+        for tb in data:
+            if isinstance(tb, pa.RecordBatch):
+                tb = pa.Table.from_batches([tb])
+            root.insert_for_join(tb, id_field, m, k, new_sidecar_name)
+        root.complete_insert_stage(id_field, m, k, new_sidecar_name)
+        root.complete_join(id_field, m, k, new_sidecar_name)
+
+    @property
+    def root_macrotile(self):
+        # It's just the first one in the iterated list.
+        for file in self.macrotiles:
+            if file.coords == (0, 0, 0):
+                return file
+        raise ValueError("No root macrotile found.")
+
+    def iterate(
+        self,
+        top_down: bool = True,
+        breadth_firth: bool = True,
+        mode: Literal["read", "append"] = "read",
+    ) -> Iterator["Tile"]:
+        """
+        Iterates through all the tiles in a constructed tree, bottom-up
+        or top-down.
+        """
+        files = self.manifest_table.to_pylist()
+        lookups: Dict[Tuple[int, ...], Rectangle] = {}
+        for f in files:
+            k = tuple(map(int, f["key"].split("/")))
+            assert len(k) == 3
+            r = json.loads(f["extent"])
+            lookups[k] = Rectangle(x=(r["x"][0], r["x"][1]), y=(r["y"][0], r["y"][1]))
+        to_check: List[Tuple[int, int, int]] = [(0, 0, 0)]
+        ordered_list = []
+        while len(to_check) > 0:
+            z, x, y = to_check.pop(0)
+            if (z, x, y) in lookups:
+                ordered_list.append((z, x, y))
+                possible_children = children((z, x, y))
+                if breadth_firth:
+                    to_check.extend(possible_children)
+                else:
+                    to_check = [*possible_children, *to_check]
+        if not top_down:
+            ordered_list.reverse()
+        for key in ordered_list:
+            yield Tile(self, extent=lookups[key], tile_code=key, mode=mode)
+
+    def iter_macrotile_order(
+        self,
+    ) -> Iterator[Tuple[Tuple[int, int, int], List["Tile"]]]:
+        macros = defaultdict(list)
+        for tile in self.iterate(top_down=True):
+            macros[macrotile(tile.coords)].append(tile)
+        for coords, tiles in macros.items():
+            yield (coords, tiles)
+
+    def iter_macrotiles(self):
+        for key, tiles in self.iter_macrotile_order():
+            t = Macrotile(self, key, tiles)
+            yield t
+
+
+class Macrotile:
+    """
+    This is an experimental class for operations that are batched across multiple tiles.
+
+    Currently it's only used for bloom filters. A macrotile consists of 21 tiles; a root,
+    its four children, and its sixteen grandchildren. each of the grandchildren is the
+    root of its *own* macrotile.
+    """
+
+    def __init__(
+        self,
+        quadtree: Quadtree,
+        coords: Tuple[int, int, int],
+        tiles: Optional[List["Tile"]] = None,
+    ):
+        # gut check -- macrotiles can never be 1/0/0, 3/1/3, etc.
+        assert coords[0] % 2 == 0
+        self.quadtree = quadtree
+        self.coords = coords
+        self._tiles = tiles
+        self._open_filehandles: Dict[
+            Path, Union[ipc.RecordBatchFileWriter, pq.ParquetWriter]
+        ] = {}
+
+    def write_batch_to_filehandle(self, path: Path, batch: pa.Table):
+        if not path in self._open_filehandles:
+            if path.suffix == ".feather":
+                self._open_filehandles[path] = ipc.new_file(path, schema=batch.schema)
+            elif path.suffix == ".parquet":
+                self._open_filehandles[path] = pq.ParquetWriter(
+                    path, schema=batch.schema
+                )
+            else:
+                raise NotImplementedError(
+                    path.suffix + " is not a supported file format"
+                )
+        # will fail if the schema changes.
+        self._open_filehandles[path].write_table(batch)
+
+    def children(self) -> List["Macrotile"]:
+        potential_children = []
+        for child in children(self.coords):
+            for grandchild in children(child):
+                potential_children.append(grandchild)
+        all_macrotiles = {mt.coords: mt for mt in self.quadtree.macrotiles}
+        actual_children = []
+        for coords in potential_children:
+            if coords in all_macrotiles:
+                actual_children.append(all_macrotiles[coords])
+        return actual_children
+
+    def tiles(self) -> Iterator["Tile"]:
+        for tile in self.quadtree.iterate(top_down=True):
+            if macrotile(tile.coords) == self.coords:
+                yield tile
+
+    def bloom_filter_loc(self, id_field: str, m: int, k: int):
+        """
+        The location for a bloom filter about field 'id_field' with log2(m) bits and k hashes.
+        """
+        (z, x, y) = self.coords
+        # Make sure the id_field is filename safe
+        id_field_enc = urlsafe_b64encode(id_field.encode("utf-8")).decode("utf-8")
+        bloom_filter_loc = (
+            self.quadtree.basedir
+            / "bloom_filters"
+            / f"{m}-{k}"
+            / f"{z}/{x}/{y}.{id_field_enc}.feather"
+        )
+        return bloom_filter_loc
+
+    def build_bloom_filter(self, id_field: str, m: int, k: int):
+        bloom_filter_loc = self.bloom_filter_loc(id_field, m, k)
+        bloom_filter_loc.parent.mkdir(parents=True, exist_ok=True)
+        if bloom_filter_loc.exists():
+            return
+
+        # Use a bool8 in numpy to actually build the filter.
+        # this takes 8x as much space as we need, but IDK a robust
+        # fast way to twiddle individual bits in python.
+
+        # At *read* time, we are carefuly to use bitmasks.
+
+        positions = np.zeros((2**m), np.bool8)
+        tilenames = []
+        id_sidecar = self.quadtree.sidecars.get(id_field, None)
+
+        for tile in self.tiles():
+            col = tile.read_column(id_field, id_sidecar)
+            # Integers are hashed as strings. Not ideal.
+            if not pa.types.is_string(col.type):
+                col = col.cast(pa.string())
+
+            # TODO: This could probably be vectorized to work more
+            # more efficiently; rather than set the bits one row at a time,
+            # build of the list of all positions and set them at once.
+
+            for item in col:
+                # Retrieve the bytes of the string.
+                bytes = item.as_buffer().to_pybytes()
+                # Hash it with md5
+                hashed = bloom_hash(bytes, m, k)
+                # Set the k positions in the fiter to true.
+                positions[hashed] = True
+            tilenames.append(tile.key)
+
+        (z, x, y) = self.coords
+
+        tb = pa.table(
+            {
+                "key": pa.array([f"{z}/{x}/{y}"]),
+                "tiles": pa.array([[tilenames]]),
+                "bitmask": pa.array([positions], pa.list_(pa.bool_(), 2**m)),
+            }
+        )
+
+        # We write records of a single row at a time. This is wasteful,
+        # but the reason we're using arrow at all for these is to get bitmask-
+        # lists in a sane form, so it's not the end of the world.
+
+        self.bloom_filter_loc(id_field, m, k).parent.mkdir(parents=True, exist_ok=True)
+        feather.write_feather(tb, bloom_filter_loc, compression="zstd")
+
+    def matched_file_loc(self, new_sidecar_name, m, k):
+        """
+        The location to which we write files that match the bloom filter here.
+        """
+        return self.bloom_filter_loc(new_sidecar_name, m, k).with_suffix(
+            ".matches.parquet"
+        )
+
+    def candidate_file_loc(self, new_sidecar_name, m, k):
+        """
+        Differs from 'matched_file_loc' because this file applies not just the
+        macrotiles filter, but filters for all macrotiles *beneath* it.
+        """
+        return self.bloom_filter_loc(new_sidecar_name, m, k).with_suffix(
+            ".candidates.parquet"
+        )
+
+    def bloom_filter(self, id_field, m, k):
+        loc = self.bloom_filter_loc(id_field, m, k)
+        if not loc.exists():
+            logger.debug(("MAKING BLOOM FILTER", self.coords, id_field, m, k))
+            self.build_bloom_filter(id_field, m, k)
+        tb = feather.read_table(loc)
+        return pc.list_flatten(tb.take([0])["bitmask"])
+
+    def bloom_filters_below_here(self, id_field, m, k, inclusive=True):
+        """
+        Returns a single bloom filter which combines together all bloom filters
+        below, including this one.
+        """
+        if inclusive:
+            total_filter = self.bloom_filter(id_field, m, k)
+        else:
+            raise NotImplementedError("Not implemented")
+            total_filter = pa.array(np.zeros(2**m), pa.bool_())
+        children = self.children()
+        while len(children) > 0:
+            child = children.pop()
+            filter = child.bloom_filter(id_field, m, k)
+            total_filter = pc.or_(total_filter, filter)
+            # Descend the tree
+            children = [*children, *child.children()]
+        return total_filter
+
+    def insert_for_join(
+        self, tb: pa.Table, id_field, m: int, k: int, new_sidecar_name: str
+    ):
+        """
+
+        The first step in a join. This can be done any number of times.
+
+        key: the join key.
+
+        """
+        assert id_field in tb.column_names, "Table must include identifier key"
+
+        # We're going to divide the data across 21 possible places.
+        # 1. A candidate file for this macrotile, because.
+        # 2. A candidate file for the macrotile of the children of this tile
+        # 3. A candidate file for each of the grandchildren of this tile, INCLUSIVE
+        #    of any of their children.
+        # Since Bloom filters are not exact, it is possible and expected that
+        # a row might be written to multiple output locations.
+
+        # At m = 24, this will take 336 MB of memory to hold the filters.
+        # at m = 28, this will take 5.3 GB of memory to hold the filters.
+
+        tb = tb.filter(pc.invert(pc.is_null(tb[id_field])))
+        id_col = tb[id_field]
+
+        # Pre-allocated a table to hold the hash for each column.
+        hashes = np.zeros((len(tb), k), np.uint32)
+        if not pa.types.is_string(id_col.type):
+            id_col = id_col.cast(pa.string())
+        for i, item in enumerate(tb[id_field]):
+            bytes = item.as_buffer().to_pybytes()
+            hashes[i] = bloom_hash(bytes, m, k)
+
+        hash_cols = pa.table({f"hash_{i}": pa.array(hashes[:, i]) for i in range(k)})
+        # logger.debug(f"Inserting for join {(self.coords, id_field, len(tb), m, k)}")
+        for macrotile in [self, *self.children()]:
+            key = str(macrotile.bloom_filter_loc(id_field, m, k))
+            if not key in self.quadtree._bloom_cache:
+                self.quadtree._bloom_cache[key] = macrotile.bloom_filter(id_field, m, k)
+            bloom_filter = self.quadtree._bloom_cache[key]
+            matches = tb
+            loc_hash_cols = hash_cols
+            for i in range(k):
+                # Go through the hashes in vectorized order.
+                is_match = bloom_filter.take(loc_hash_cols[f"hash_{i}"])
+                matches = matches.filter(is_match)
+                loc_hash_cols = loc_hash_cols.filter(is_match)
+
+            if len(matches) > 0:
+                path = macrotile.matched_file_loc(new_sidecar_name, m, k)
+                macrotile.write_batch_to_filehandle(path, matches)
+
+        # for grandchildren, insert everything below here.
+        for child in self.children():
+            for grandchild in child.children():
+                key = (
+                    str(grandchild.bloom_filter_loc(id_field, m, k))
+                    + "_with_descendants"
+                )
+                if not key in self.quadtree._bloom_cache:
+                    self.quadtree._bloom_cache[key] = (
+                        grandchild.bloom_filters_below_here(id_field, m, k)
+                    )
+
+                bloom_filter = self.quadtree._bloom_cache[key]
+                matches = tb
+                loc_hash_cols = hash_cols
+                for i in range(k):
+                    # Go through the hashes in vectorized order.
+                    is_match = bloom_filter.take(loc_hash_cols[f"hash_{i}"])
+                    matches = matches.filter(is_match)
+                    loc_hash_cols = loc_hash_cols.filter(is_match)
+                if len(matches) > 0:
+                    path = grandchild.candidate_file_loc(new_sidecar_name, m, k)
+                    macrotile.write_batch_to_filehandle(path, matches)
+
+    def close_filehandles(self, recursive=True):
+        """
+        Closes any open files below this point in the tree.
+
+        Called in complete_insert_stage.
+        """
+        for path, file in [*self._open_filehandles.items()]:
+            file.close()
+            del self._open_filehandles[path]
+        if recursive:
+            for child in self.children():
+                child.close_filehandles()
+
+    def complete_insert_stage(self, id_field, m: int, k: int, new_sidecar_name):
+        """
+        The second step in a join. Finalizes the insertion recursively below, and
+        closes any remaining resources.
+        """
+        self.close_filehandles(recursive=True)
+        # Close the lagging bloom filters
+        self.quadtree._bloom_cache = {}
+
+        if self.candidate_file_loc(new_sidecar_name, m, k).exists():
+            # "Candidate file loc" means that we encountered a bloom filter match
+            # including all of the children of this tile.
+            if len(self.children()) == 0:
+                # If we have preliminary unmerged files but no children,
+                # this means that we're done inserting, and can rename it
+                # to be a 'matched' file.
+                self.candidate_file_loc(new_sidecar_name, m, k).rename(
+                    self.matched_file_loc(new_sidecar_name, m, k)
+                )
+            else:
+                # Otherwise, we need to recursively insert that file
+                # at an appropriate point in the tree.
+                for batch in pq.ParquetFile(
+                    self.candidate_file_loc(new_sidecar_name, m, k)
+                ).iter_batches():
+                    b = pa.Table.from_batches([batch])
+                    self.insert_for_join(
+                        b,
+                        id_field,
+                        m,
+                        k,
+                        new_sidecar_name,
+                    )
+                # Clean up the candidate file, because it has now been inserted below here.
+                self.candidate_file_loc(new_sidecar_name, m, k).unlink()
+                # Close the filehandles for the children immediately to avoid
+                # lagging writers
+                self.close_filehandles()
+                self.quadtree._bloom_cache = {}
+        for child in self.children():
+            # Finally, we need to recursively complete the insert stage for all children.
+            # This ensure that there all candidate files have been flushed to the farthest leaves
+            # of the quadtree, that all files are closed and that there are no lingering
+            # resources.
+            child.complete_insert_stage(id_field, m, k, new_sidecar_name)
+        # I don't *think* this is necessary, but one last check to make sure that
+        # all the filehandles are closed.
+        self.close_filehandles()
+        self.quadtree._bloom_cache = {}
+
+    def complete_join(self, id_field, m, k, new_sidecar_name):
+        """
+        The third and final stage in a join.
+        Called once all the record batches of a join have been inserted.
+        Now that we have parquet files identifying for each macrotile of 21 tiles
+        a set of candidate matches, we can now read those files and write out
+        the final sidecar files in exactly the same order as the original files.
+        """
+        try:
+            sidecar = self.quadtree.sidecars[id_field]
+        except KeyError:
+            sidecar = None
+
+        if not self.matched_file_loc(new_sidecar_name, m, k).exists():
+            # Can happen if there are no matches.
+            pass
+        
+        else:
+            for tile in self.tiles():
+                dest = tile.filename.with_suffix(f".{new_sidecar_name}.feather")
+                if dest.exists():
+                    raise FileExistsError(f"File {dest} already exists.")
+                    # logger.warning(f"File {dest} already exists.")
+                    # continue
+                ids = tile.read_column(id_field, sidecar)
+                # Read *only* the relevant rows of the parquet file.
+                # So long as the
+                matches = pq.read_table(
+                    self.matched_file_loc(new_sidecar_name, m, k),
+                    filters=[(id_field, "in", ids)],
+                )
+                sort_indices = pc.index_in(ids, matches[id_field])
+
+                # Now we reshuffle the matches to be in the same order as the original file.
+
+                towrite = matches.drop([id_field]).take(sort_indices)
+                try:
+                    # Sidecars should generally be a single record batch, but if they
+                    # contain more than 2GB of text this may break.
+                    towrite = towrite.combine_chunks()
+                except pa.lib.ArrowInvalid:
+                    logger.warning(f"Failed to combine chunks for {tile.coords}")
+                feather.write_feather(
+                    towrite,
+                    dest,
+                    compression="uncompressed",
+                )
+        for mychild in self.children():
+            mychild.complete_join(id_field, m, k, new_sidecar_name)
+
+
+def bloom_hash(val: bytes, m: int, k: int) -> np.ndarray:
+    """
+    Hash bytes
+    Hashes a value val in k buckets out of 2**m total buckets.
+
+    returns: a numpy integer array of length k indicating which numbers are set.
+    """
+
+    # Rather than actually hash m times for the bloom filter, we make a single
+    # md5 hash which is 32 bytes, and then take slices of that offset by one byte
+    # at a time to represent the different hash functions. So if there are
+    #
+    # Should this be 4 or 8?
+    each_takes = int(m / 4)
+    assert (
+        32 - each_takes
+    ) > k, f"cannot have more than {(32 - each_takes)} hashes in bloom index"
+
+    vals = np.zeros(k, np.uint32)
+    hashed = hashlib.md5(val).hexdigest()
+    # Since we're
+    for i in range(k):
+        hash = int(hashed[i : i + each_takes], 16)
+        vals[i] = hash
+    return vals
+
+
+def children(coords: Tuple[int, int, int]):
+    z, x, y = coords
+    return [(z + 1, x * 2 + i, y * 2 + j) for i in (0, 1) for j in (0, 1)]
+
+
+def parent(coords: Tuple[int, int, int]):
+    z, x, y = coords
+    return (z - 1, x // 2, y // 2)
+
+
+def macrotile(coords: Tuple[int, int, int]) -> Tuple[int, int, int]:
+    if coords[0] == 0:
+        return (0, 0, 0)
+    if coords[0] % 2 == 0:
+        return parent(parent(coords))
+    return parent(coords)
+
 
 class Tile:
     """
@@ -531,12 +1068,11 @@ class Tile:
         self,
         quadtree: Quadtree,
         extent: Union[Rectangle, Tuple[Tuple[float, float], Tuple[float, float]]],
-        basedir: Path,
         tile_code: Tuple[int, int, int] = (0, 0, 0),
         permitted_children: Optional[int] = 4,
-        randomize=0.0,
         # Actually dict of pa type constructors.
         parent: Optional["Tile"] = None,
+        mode: Literal["read", "write", "append"] = "read",
     ):
         """
         Create a tile.
@@ -546,13 +1082,10 @@ class Tile:
         """
         self.ix_extent: Tuple[int, int] = (-1, -2)  # Initalize with bad values
         self.coords = tile_code
-        logger.debug(f"{' ' * self.coords[0]} creating {self.coords}")
         self.quadtree = quadtree
         if isinstance(extent, tuple):
             extent = Rectangle(x=extent[0], y=extent[1])
         self.extent = extent
-        self.randomize = randomize
-        self.basedir = basedir
         self.schema = None
         self.permitted_children = permitted_children
         # Wait to actually create the directories until needed.
@@ -617,9 +1150,9 @@ class Tile:
             else:
                 d[t] = tab[t]
 
-        if self.randomize > 0:
+        if self.quadtree.randomize > 0:
             # Optional circular jitter to avoid overplotting.
-            rho = nprandom.normal(0, self.randomize, tab.shape[0])
+            rho = nprandom.normal(0, self.quadtree.randomize, tab.shape[0])
             theta = nprandom.uniform(0, 2 * np.pi, tab.shape[0])
             d["x"] = pc.add(d["x"], pc.multiply(rho, pc.cos(theta)))
             d["y"] = pc.add(d["y"], pc.multiply(rho, pc.sin(theta)))
@@ -635,7 +1168,6 @@ class Tile:
         """
         Completes the quadtree so that no more points can be added.
         """
-        # print(f"{' ' * self.coords[0]} finalizing {self.key}")
         logger.debug(f"first flush of {self.coords} complete")
         for tile in self.iterate(direction="top-down"):
             # First, we close any existing overflow buffers.
@@ -662,7 +1194,7 @@ class Tile:
                                 root = root.append_column(col, batch[col])
                         yield root.combine_chunks().to_batches()[0]
 
-                # Insert in chunks of 100M
+                # Insert in chunks of 100 megabytes
                 for batch in rebatch(yielder(), 100e6):
                     tile.insert(batch)
                 tile.overflow_loc.unlink()
@@ -676,8 +1208,6 @@ class Tile:
         for tile in self.iterate(direction="bottom-up"):
             manifest = tile.final_flush()
             n_complete += 1
-        # print(f"{' ' * self.coords[0]} finalized {self.key}")
-
         return manifest  # is now the tile manifest for the root.
 
     def __repr__(self):
@@ -697,7 +1227,7 @@ class Tile:
         if self._filename is not None:
             return self._filename
         local_name = Path(*map(str, self.coords)).with_suffix(".feather")
-        dest_file = self.basedir / local_name
+        dest_file = self.quadtree.basedir / local_name
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         self._filename = dest_file
         return self._filename
@@ -853,7 +1383,7 @@ class Tile:
         raise ValueError("Children have not been created.")
 
     def make_children(self, weights: List[float]):
-        logger.warning(
+        logger.debug(
             f"{' ' * self.coords[0]} Making children with budget of {self.permitted_children} for {self.key}, weights of {weights}"
         )
         # QUAD ONLY
@@ -891,7 +1421,6 @@ class Tile:
                 child = Tile(
                     quadtree=self.quadtree,
                     extent=extent,
-                    basedir=self.basedir,
                     tile_code=coords,
                     parent=self,
                     permitted_children=child_permission[i * 2 + j],
@@ -919,8 +1448,8 @@ class Tile:
             self.schema = table.schema
             return
         if not self.schema.equals(table.schema):
-            logger.error("INSERTING:", table.schema)
-            logger.error("OWN SCHEMA", self.schema)
+            logger.debug("INSERTING:", table.schema)
+            logger.debug("OWN SCHEMA", self.schema)
             raise TypeError("Attempted to insert a table with a different schema.")
 
     def insert_table(self, table: pa.Table):
@@ -982,6 +1511,12 @@ class Tile:
         schemas = self.quadtree.schemas
         return {k: table.select(schemas[k].names) for k in cars}
 
+    def read_column(self, column: str, sidecar: Optional[str]) -> pa.Array:
+        fname = self.filename
+        if sidecar is not None:
+            fname = self.filename.with_suffix(f".{sidecar}.feather")
+        return feather.read_table(fname, columns=[column])[column]
+
 
 def get_better_codes(col, counter=Counter()):
     for a in pc.value_counts(col):
@@ -1028,6 +1563,14 @@ def rebatch(input: Iterator[pa.RecordBatch], size: float) -> Iterator[pa.Table]:
         yield pa.Table.from_batches(buffer)
 
 
-if __name__ == "__main__":
+def cli():
     args = parse_args()
+    if args["log_level"]:
+        logger.setLevel(args["log_level"])
+        del args["log_level"]
+
     main(**args)
+
+
+if __name__ == "__main__":
+    cli()

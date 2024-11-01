@@ -7,7 +7,7 @@ setup(
     name="quadfeather",
     entry_points={
         "console_scripts": [
-            "quadfeather = quadfeather.tiler:main",
+            "quadfeather = quadfeather.tiler:cli",
             "quadfeather-test-data = quadfeather.demo:main",
             "quadfeather-sidecars = quadfeather.add_sidecars:add_sidecars_cli",
         ],
