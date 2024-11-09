@@ -30,6 +30,10 @@ class TestCSV:
             }
         )
         tb = feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
+        manifest = feather.read_table(tmp_path / "tiles" / "manifest.feather")
+        assert manifest.num_rows == 1
+        assert manifest["min_ix"][0].as_py() == 0
+        assert manifest["max_ix"][0].as_py() == 3
         # Should introduce a new 'ix' column.
         for k in ["ix", "x", "y", "z"]:
             assert k in tb.column_names
