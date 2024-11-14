@@ -180,6 +180,32 @@ class TestCSV:
         assert "ix" in tb2.column_names
 
 
+class TestFancyFormats:
+    def test_dates(self, tmp_path):
+        size = 10_000
+        demo_parquet(tmp_path / "test.parquet", size=size)
+        tb = pq.read_table(tmp_path / "test.parquet")
+        date = pa.array(
+                [random.choice(["2020-01-01", "2020-01-02", "2020-01-03"]) for _ in range(size)],
+            )
+        as_datetime = pc.strptime(date, format="%Y-%m-%d", unit='s')
+        tb = tb.append_column(
+            'date2',
+            as_datetime
+        )
+        pq.write_table(tb, tmp_path / "test.parquet")
+        qtree = main(
+            files=[tmp_path / "test.parquet"],
+            destination=tmp_path / "tiles",
+            tile_size=5000,
+            first_tile_size=1000,
+        )
+        manifest = qtree.manifest_table
+        assert pc.sum(manifest["nPoints"]).as_py() == size
+        tb = feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
+        assert "date" in tb.column_names
+        assert pa.types.is_timestamp(tb["date2"].type)
+
 class TestParquet:
     def test_big_parquet(self, tmp_path):
         size = 5_000_000
