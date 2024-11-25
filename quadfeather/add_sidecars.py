@@ -2,11 +2,8 @@ import argparse
 from pathlib import Path
 import pyarrow as pa
 from pyarrow import compute as pc
-from pyarrow import feather
 from .tiler import Quadtree
 from .ingester import get_ingester
-import json
-from typing import Iterator, Optional
 
 
 def parse_args():
