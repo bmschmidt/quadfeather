@@ -951,7 +951,7 @@ class Macrotile:
         if not self.matched_file_loc(new_sidecar_name, m, k).exists():
             # Can happen if there are no matches.
             pass
-        
+
         else:
             for tile in self.tiles():
                 dest = tile.filename.with_suffix(f".{new_sidecar_name}.feather")
@@ -1054,11 +1054,12 @@ class Tile:
         destination
 
         """
-        self.ix_extent: Tuple[int, int] = (-1, -2)  # Initalize with bad values
         self.coords = tile_code
         self.quadtree = quadtree
         if isinstance(extent, tuple):
             extent = Rectangle(x=extent[0], y=extent[1])
+        self.min_ix = 1_000_000_000_000
+        self.max_ix = -1
         self.extent = extent
         self.schema = None
         self.permitted_children = permitted_children
@@ -1112,7 +1113,8 @@ class Tile:
                 ),
             )
         self.count_inserted += len(tab)
-
+        self.min_ix = min(self.min_ix, tab["ix"][0].as_py())
+        self.max_ix = max(self.max_ix, tab["ix"][-1].as_py())
         # A remapped version of the tile.
         d = dict()
         # Remap values if necessary.
@@ -1247,7 +1249,7 @@ class Tile:
                         raise ValueError("Child has not been flushed.")
                     self.total_points += child.total_points
                     children.append(child.manifest)
-        min_ix, max_ix = self.ix_extent
+        min_ix, max_ix = self.min_ix, self.max_ix
 
         self.total_points += self.n_data_points
         self.manifest = TileManifest(
