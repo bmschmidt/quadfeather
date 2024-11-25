@@ -82,6 +82,33 @@ def flatten_manifest(mani: TileManifest) -> List[Dict]:
     return d
 
 
+def rebatch(
+    input: Iterator[pa.RecordBatch], size: float, max_rows: float = float("inf")
+) -> Iterator[pa.Table]:
+    """
+    Assembles an iterator over record batches into a predictable memory size
+
+    Yields *more* than the requested size to avoid bad situations of zero-size arrays.
+    """
+    buffer = []
+    buffer_size = 0
+    buffer_rows = 0
+    for batch in input:
+        buffer_size += batch.nbytes
+        buffer_rows += batch.num_rows
+        buffer.append(batch)
+
+        if buffer_size > size or buffer_rows > max_rows:
+            tb = pa.Table.from_batches(buffer).combine_chunks()
+            buffer = []
+            buffer_size = 0
+            buffer_rows = 0
+            yield tb
+    if len(buffer) > 0:
+        tb = pa.Table.from_batches(buffer)
+        yield tb.combine_chunks()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Tile an input file into a large number of arrow files."
@@ -1471,12 +1498,9 @@ class Tile:
                 child_tile.insert_table(subset)
         else:
             for sidecar, tb in self.keyed_batches(table).items():
-                for batch in tb.to_batches():
-                    try:
+                for tb in rebatch(tb.to_batches(), 50e6):
+                    for batch in tb.to_batches():
                         self.overflow_buffers[sidecar].write_batch(batch)
-                    except:
-                        pass
-                        raise
 
     def keyed_batches(self, table: pa.Table):
         """
@@ -1518,25 +1542,6 @@ def remap_dictionary(chunk, new_order):
 
     new_indices = pc.index_in(chunk, new_order)
     return pa.DictionaryArray.from_arrays(new_indices, new_order)
-
-
-def rebatch(input: Iterator[pa.RecordBatch], size: float) -> Iterator[pa.Table]:
-    """
-    Assembles an iterator over record batches into a predictable memory size
-
-    Yields *more* than the requested size to avoid bad situations of zero-size arrays.
-    """
-    buffer = []
-    buffer_size = 0
-    for batch in input:
-        buffer_size += batch.nbytes
-        buffer.append(batch)
-        if buffer_size > size:
-            yield pa.Table.from_batches(buffer)
-            buffer = []
-            buffer_size = 0
-    if len(buffer) > 0:
-        yield pa.Table.from_batches(buffer)
 
 
 def cli():
