@@ -1,7 +1,6 @@
 import pyarrow as pa
 from pyarrow import csv, feather, parquet as pq, compute as pc, ipc as ipc
 
-# import pandas as pd
 import logging
 from pathlib import Path
 import sys

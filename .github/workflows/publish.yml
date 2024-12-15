@@ -1,0 +1,77 @@
+name: "Publish to PyPI"
+
+on:
+  # Run on both release and push events as an example.
+  release:
+    types: [published]
+  push:
+    branches: [main]
+
+jobs:
+  pypi-publish:
+    name: Upload to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+    permissions:
+      # Needed for OIDC if you later return to trusted publishing, but harmless if using token
+      id-token: write
+    steps:
+      - uses: actions/checkout@v3
+
+      # This step only runs if we are NOT in a release event.
+      # It parses pyproject.toml, increments the minor version, and adds "rc1".
+      - name: Update version for a pre-release
+        if: ${{ github.event_name != 'release' }}
+        run: |
+          python3 <<EOF
+          import re
+          from pathlib import Path
+
+          pyproject = Path("pyproject.toml")
+          contents = pyproject.read_text()
+
+          # Find the current version line, assuming it looks like: version = "X.Y.Z"
+          match = re.search(r'version\s*=\s*"([^"]+)"', contents)
+          if not match:
+              raise ValueError("No version line found in pyproject.toml")
+
+          current_version = match.group(1)
+
+          # Split the current version by dots
+          parts = current_version.split('.')
+          if len(parts) < 3:
+              raise ValueError("Expected a version with at least major.minor.patch")
+
+          major, minor, patch = parts[0], parts[1], parts[2]
+
+          # Increment the minor version for our pre-release
+          minor = str(int(minor) + 1)
+
+          # Add an rc indicator (could be dynamic if you like)
+          # Here we just set rc1 whenever this runs.
+          new_version = f"{major}.{minor}.{patch}rc1"
+
+          new_contents = re.sub(r'version\s*=\s*"([^"]+)"', f'version = \"{new_version}\"', contents)
+          pyproject.write_text(new_contents)
+          EOF
+
+      - name: Confirm project files
+        run: ls -la
+
+      - name: "Install uv"
+        uses: astral-sh/setup-uv@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: wheels
+          merge-multiple: true
+
+      - name: "Build"
+        run: uv build
+
+      - name: Publish to PyPi
+        run: uv publish --token $PIP_KEY -v dist/*
+        env:
+          PIP_KEY: ${{ secrets.PIP_KEY }}

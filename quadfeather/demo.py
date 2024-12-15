@@ -1,12 +1,15 @@
 import numpy as np
 from numpy import random
 from random import choice, shuffle
-import pandas as pd
 import pyarrow as pa
 import sys
 from pyarrow import parquet as pq
 from quadfeather.tiler import Rectangle
 from pyarrow import compute as pc
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 
 dates = []
 
@@ -17,7 +20,6 @@ for y in range(1900, 2020):
         dates.append(f"{y}-{m:02d}")
         for d in range(1, 6):
             dates.append(f"{y}-{m:02d}-{d:02d}")
-
 
 def rbatch(
     SIZE,
@@ -100,6 +102,8 @@ def main(path="tmp.csv", SIZE=None):
             SIZE = int(sys.argv[1])
         except:
             SIZE = 100_000
+    if pd is None:
+        raise ImportError("Must install pandas for demo script.")
     frames = rbatch(SIZE).to_pandas()
     frames = frames.sample(frac=1)
     # Add an unseen level at the very end.
