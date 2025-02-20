@@ -69,7 +69,7 @@ def flatten_manifest(mani: TileManifest) -> List[Dict]:
     queue = [mani]
     d = []
     
-    while queue:
+    while len(queue) > 0:
         current = queue.pop(0)
         d.append({
             "key": current.key,
