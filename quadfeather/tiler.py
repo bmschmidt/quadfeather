@@ -65,19 +65,21 @@ class TileManifest:
 
 
 def flatten_manifest(mani: TileManifest) -> List[Dict]:
-    # Flatten a manifest into a table.
-    # This is a recursive function.
-    d = [
-        {
-            "key": mani.key,
-            "nPoints": mani.nPoints,
-            "min_ix": mani.min_ix,
-            "max_ix": mani.max_ix,
-            "extent": json.dumps(mani.to_dict()["extent"]),
-        }
-    ]
-    for child in mani.children:
-        d += flatten_manifest(child)
+    # Flatten a manifest into a table using breadth-first search
+    queue = [mani]
+    d = []
+    
+    while queue:
+        current = queue.pop(0)
+        d.append({
+            "key": current.key,
+            "nPoints": current.nPoints, 
+            "min_ix": current.min_ix,
+            "max_ix": current.max_ix,
+            "extent": json.dumps(current.to_dict()["extent"]),
+        })
+        queue.extend(current.children)
+        
     return d
 
 
