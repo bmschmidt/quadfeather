@@ -1528,8 +1528,14 @@ class Tile:
         else:
             for sidecar, tb in self.keyed_batches(table).items():
                 for tb in rebatch(tb.to_batches(), 50e6):
+                    writer_schema = self.overflow_buffers[sidecar].schema
                     for batch in tb.to_batches():
-                        self.overflow_buffers[sidecar].write_batch(batch)
+                        # ensure the new batch has the exact schema instance from the writer
+                        aligned_batch = pa.RecordBatch.from_arrays(
+                            [batch[field.name] for field in writer_schema],
+                            schema=writer_schema
+                        )
+                        self.overflow_buffers[sidecar].write_batch(aligned_batch)
 
     def keyed_batches(self, table: pa.Table):
         """
