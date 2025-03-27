@@ -529,9 +529,17 @@ class Quadtree:
             if field.name in self.schema.names:
                 # Check if the user requested a cast
                 dtype = self.schema.field(field.name).type
-            if field in self.dictionaries:
+            if field.name in self.dictionaries:
                 # dictionaries are written later.
-                dtype = pa.dictionary(pa.int16(), pa.utf8())
+                itype = pa.int8()
+                if len(self.dictionaries[field.name]) >= 2**7:
+                    itype = pa.int16()
+                if len(self.dictionaries[field.name]) >= 2**15:
+                    itype = pa.int32()
+                if len(self.dictionaries[field.name]) >= 2**31:
+                    itype = pa.int64()
+
+                dtype = pa.dictionary(itype, pa.utf8())
             fields[car].append(pa.field(field.name, dtype))
 
         fields[self.sidecars.get("ix", "")].append(pa.field("ix", pa.uint64()))
@@ -1529,7 +1537,11 @@ class Tile:
             for sidecar, tb in self.keyed_batches(table).items():
                 for tb in rebatch(tb.to_batches(), 50e6):
                     for batch in tb.to_batches():
-                        self.overflow_buffers[sidecar].write_batch(batch)
+                        try:
+                            self.overflow_buffers[sidecar].write_batch(batch)
+                        except Exception as e:
+                            logger.error(f"Error writing batch to {sidecar}: {e}")
+                            raise e
 
     def keyed_batches(self, table: pa.Table):
         """
@@ -1569,7 +1581,15 @@ def remap_dictionary(chunk, new_order):
     # Switch a dictionary to use a pre-assigned set of keys. returns a new chunked dictionary array.
 
     new_indices = pc.index_in(chunk, new_order)
-    return pa.DictionaryArray.from_arrays(new_indices, new_order)
+    itype = pa.int8()
+    if len(new_order) >= 2**7:
+        itype = pa.int16()
+    if len(new_order) >= 2**15:
+        itype = pa.int32()
+    if len(new_order) >= 2**31:
+        itype = pa.int64()
+    indices = new_indices.cast(itype)
+    return pa.DictionaryArray.from_arrays(indices, new_order)
 
 
 def cli():

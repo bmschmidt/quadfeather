@@ -224,10 +224,28 @@ class TestParquet:
         assert ps[1] == 1
         assert ps[-1] == 999
 
+class TestManyLittleFiles:
+    def test_small_chunks(self, tmp_path):
+        size = 100_000
+        demo_parquet(tmp_path / "test.parquet", size=size)
+        qtree = main(
+            files=[tmp_path / "test.parquet"],
+            destination=tmp_path / "tiles",
+            tile_size=50,
+            first_tile_size=5,
+            sidecars={"class": "class_sidecar"},
+        )
+        manifest = qtree.manifest_table
+        assert pc.sum(manifest["nPoints"]).as_py() == size
+        tb = feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
+        ps = tb["ix"].to_pylist()
+        assert ps[0] == 0
+        assert ps[1] == 1
+        assert ps[-1] == 4
 
 class TestStreaming:
     def test_streaming_batches(self, tmp_path):
-        size = 5_000_000
+        size = 2_000_000
         demo_parquet(
             tmp_path / "t.parquet", size=size, extent=Rectangle(x=(0, 100), y=(0, 100))
         )
@@ -238,9 +256,12 @@ class TestStreaming:
             basedir=tmp_path / "tiles",
             tile_size=9_000,
             dictionaries={
+                # Force a dictionary to be written to a sidecar.
                 "cat": pa.array(["apple", "banana", "strawberry", "mulberry"]),
-                "sidecars": {"cat": "cat"},
+                # Same data, different dictionary. This one will be written to the main table.
+                "class": pa.array(["banana", "strawberry", "mulberry", "apple", "orange", "pineapple"]),
             },
+            sidecars= {"cat": "cat"},
             first_tile_size=1000,
         )
 
@@ -254,7 +275,8 @@ class TestStreaming:
         assert pc.sum(manifest["nPoints"]).as_py() == size
 
         tb = feather.read_table(tmp_path / "tiles" / "0/0/0.feather")
-
+        assert "banana" in tb['class'].to_pylist()
+        assert "orange" not in tb['class'].to_pylist()
 
 class TestAppends:
     """
