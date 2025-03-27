@@ -31,18 +31,18 @@ def rbatch(
     if method == "lognormal":
         f = random.lognormal
         classes = [
-            ("Banana", [5, 0.01], [5, 0.01]),
-            ("Strawberry", [3.5, 0.4], [3, 0.3]),
-            ("Apple", [4.6, 0.2], [3, 0.2]),
-            ("Mulberry", [5.6, 0.6], [6, 0.5]),
+            ("banana", [5, 0.01], [5, 0.01]),
+            ("strawberry", [3.5, 0.4], [3, 0.3]),
+            ("apple", [4.6, 0.2], [3, 0.2]),
+            ("mulberry", [5.6, 0.6], [6, 0.5]),
         ]
     else:
         f = random.normal
         classes = [
-            ("Banana", [0, 0.2], [0, 0.3]),
-            ("Strawberry", [3, 0.05], [-3, 2]),
-            ("Apple", [-4.6, 0.1], [-5, 0.25]),
-            ("Mulberry", [5.6, 2.6], [6, 2.5]),
+            ("banana", [0, 0.2], [0, 0.3]),
+            ("strawberry", [3, 0.05], [-3, 2]),
+            ("apple", [-4.6, 0.1], [-5, 0.25]),
+            ("mulberry", [5.6, 2.6], [6, 2.5]),
         ]
 
     for c, xparam, yparam in classes:
@@ -69,6 +69,7 @@ def rbatch(
                 "y": y,
                 "position": position,
                 "class": [c] * len(x),
+                "cat": [c] * len(x),
                 "quantity": random.random(len(x)),
                 "date": date,
             }
