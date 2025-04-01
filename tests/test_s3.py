@@ -1,16 +1,18 @@
 from pyarrow import fs
 from quadfeather.tiler import *
 from pathlib import Path
+import s3fs
 
 import pytest
 
+
 def get_s3_filesystem(region: str = "us-east-2"):
-    return fs.S3FileSystem(
-        region=region,
-    )
+    filesystem = s3fs.S3FileSystem(s3_additional_kwargs={'ServerSideEncryption': 'AES256'}, client_kwargs={'region_name': region})
+    filesystem = fs.FSSpecHandler(filesystem)
+    return fs.PyFileSystem(filesystem)
 
 @pytest.mark.skip(reason="This is a slow test that requires a real S3 bucket.")
-def test_s3_filesystem(bucket_name: str,NUM_POINTS=100_000, TILE_SIZE=10_000):
+def test_s3_filesystem(bucket_name: str, NUM_POINTS=100_000, TILE_SIZE=10_000):
     fs = get_s3_filesystem()
     basedir = Path(bucket_name) / "tiles"
     print("Creating test data...")
