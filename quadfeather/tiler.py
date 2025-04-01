@@ -463,7 +463,7 @@ class Quadtree:
     # Easier file system handling methods
 
     def write_feather(self, write_path: Path, table: pa.Table, compression: Literal["zstd", "uncompressed"] = "zstd"):
-        with self.filesystem.open_output_stream(write_path.as_posix()) as f:
+        with self.filesystem.open_output_stream(write_path.as_posix(), metadata=None) as f:
             feather.write_feather(table, f, compression=compression)
 
     def read_feather(self, read_path: Path, columns: Optional[List[str]] = None) -> pa.Table:
@@ -713,7 +713,7 @@ class Macrotile:
 
     def write_batch_to_filehandle(self, path: Path, batch: pa.Table):
         if not path in self._open_filehandles:
-            open_filehandle = self.quadtree.filesystem.open_output_stream(path.as_posix())
+            open_filehandle = self.quadtree.filesystem.open_output_stream(path.as_posix(), metadata=None)
             if path.suffix == ".feather":
                 self._open_filehandles[path] = ipc.new_file(open_filehandle, schema=batch.schema)
             elif path.suffix == ".parquet":
@@ -1399,7 +1399,7 @@ class Tile:
             p = self.overflow_loc
             if k != "":
                 p = p.with_suffix(f".{k}.arrow")
-            self._sinks[k] = self.quadtree.filesystem.open_output_stream(p.as_posix())
+            self._sinks[k] = self.quadtree.filesystem.open_output_stream(p.as_posix(), metadata=None)
             self._overflow_writers[k] = pa.ipc.new_file(
                 self._sinks[k], self.quadtree.schemas[k]
             )
